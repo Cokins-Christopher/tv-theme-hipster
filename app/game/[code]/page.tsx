@@ -20,9 +20,9 @@ export default function GamePage() {
   const [allTimelines, setAllTimelines] = useState<Map<string, Timeline[]>>(new Map());
   const [currentShow, setCurrentShow] = useState<Show | null>(null);
   const [attempts, setAttempts] = useState<Attempt[]>([]);
-  const [guessType, setGuessType] = useState<GuessType>('before');
-  const [selectedX, setSelectedX] = useState<number | null>(null);
-  const [selectedY, setSelectedY] = useState<number | null>(null);
+  const [selectedBeforeYear, setSelectedBeforeYear] = useState<number | null>(null);
+  const [selectedBetweenYears, setSelectedBetweenYears] = useState<[number, number] | null>(null);
+  const [selectedAfterYear, setSelectedAfterYear] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -180,9 +180,23 @@ export default function GamePage() {
               const newState = payload.new as GameState;
               console.log('[Game] New game state round_state:', newState.round_state);
               setGameState(newState);
+              
+              // Check if lobby is finished and redirect (refetch to get latest status)
+              const { data: currentLobby } = await supabase
+                .from('lobbies')
+                .select('status')
+                .eq('id', lobbyIdToUse)
+                .single();
+              
+              if (currentLobby?.status === 'finished') {
+                console.log('[Game] Lobby finished, redirecting to lobby...');
+                setLobby({ ...lobby, status: 'finished' } as Lobby);
+                router.push(`/lobby/${code}`);
+                return;
+              }
 
               // Fetch new show if changed or if we don't have one yet
-              if (newState.show_id && (newState.show_id !== gameState?.show_id || !currentShow)) {
+              if (newState.show_id) {
                 console.log('[Game] Fetching show from realtime update:', newState.show_id);
                 const { data: showData, error: showError } = await supabase
                   .from('shows')
@@ -200,11 +214,34 @@ export default function GamePage() {
                 }
               }
 
+              // IMPORTANT: Fetch timelines when game state changes
+              // This ensures timelines are loaded when game starts or state changes
+              console.log('[Game] Refreshing timelines after game state update...');
+              const { data: timelinesData } = await supabase
+                .from('timelines')
+                .select('*')
+                .eq('lobby_id', lobbyIdToUse)
+                .order('year_value', { ascending: true });
+
+              if (timelinesData) {
+                const timelineMap = new Map<string, Timeline[]>();
+                for (const timeline of timelinesData) {
+                  const existing = timelineMap.get(timeline.player_id) || [];
+                  timelineMap.set(timeline.player_id, [...existing, timeline]);
+                }
+                setAllTimelines(timelineMap);
+                if (id) {
+                  const myTimelineData = timelineMap.get(id) || [];
+                  setMyTimeline(myTimelineData);
+                  console.log('[Game] Timelines refreshed after game state update:', myTimelineData.length, 'years for me');
+                }
+              }
+
               // Reset guess UI when round changes
               if (newState.current_round_number !== gameState?.current_round_number) {
-                setSelectedX(null);
-                setSelectedY(null);
-                setGuessType('before');
+                setSelectedBeforeYear(null);
+                setSelectedBetweenYears(null);
+                setSelectedAfterYear(null);
               }
 
               // Fetch attempts for new round
@@ -237,22 +274,24 @@ export default function GamePage() {
           table: 'lobbies',
           filter: `join_code=eq.${code.toUpperCase()}`,
         },
-        (payload) => {
-          console.log('[Game] Lobby update:', payload.eventType);
-          if (payload.eventType === 'UPDATE') {
-            const updatedLobby = payload.new as Lobby;
-            setLobby(updatedLobby);
-            
-            // Set up game state subscription when we have lobby ID
-            if (updatedLobby.id) {
-              setupGameStateSubscription(updatedLobby.id);
-            }
-            
-            if (updatedLobby.status === 'finished') {
-              // Game over - could show winner screen
+          (payload) => {
+            console.log('[Game] Lobby update:', payload.eventType);
+            if (payload.eventType === 'UPDATE') {
+              const updatedLobby = payload.new as Lobby;
+              setLobby(updatedLobby);
+              
+              // Set up game state subscription when we have lobby ID
+              if (updatedLobby.id) {
+                setupGameStateSubscription(updatedLobby.id);
+              }
+              
+              if (updatedLobby.status === 'finished') {
+                // Game over - redirect all players back to lobby
+                console.log('[Game] Game finished, redirecting to lobby...');
+                router.push(`/lobby/${code}`);
+              }
             }
           }
-        }
       )
       .subscribe((status) => {
         console.log('[Game] Lobby subscription status:', status);
@@ -277,6 +316,7 @@ export default function GamePage() {
             filter: `lobby_id=eq.${lobbyIdToUse}`,
           },
           async () => {
+            console.log('[Game] Timeline change detected, refreshing...');
             const { data: timelinesData } = await supabase
               .from('timelines')
               .select('*')
@@ -291,12 +331,16 @@ export default function GamePage() {
               }
               setAllTimelines(timelineMap);
               if (id) {
-                setMyTimeline(timelineMap.get(id) || []);
+                const myTimelineData = timelineMap.get(id) || [];
+                setMyTimeline(myTimelineData);
+                console.log('[Game] My timeline updated:', myTimelineData.length, 'years');
               }
             }
           }
         )
-        .subscribe();
+        .subscribe((status) => {
+          console.log('[Game] Timelines subscription status:', status);
+        });
 
       if (attemptsChannel) supabase.removeChannel(attemptsChannel);
       attemptsChannel = supabase
@@ -351,7 +395,7 @@ export default function GamePage() {
   // Fetch show when gameState.show_id changes and we don't have the show yet
   useEffect(() => {
     const fetchShow = async () => {
-      if (gameState?.show_id && !currentShow) {
+      if (gameState?.show_id && (!currentShow || currentShow.id !== gameState.show_id)) {
         console.log('[Game] Fetching show from useEffect:', gameState.show_id);
         const { data: showData, error: showError } = await supabase
           .from('shows')
@@ -373,15 +417,64 @@ export default function GamePage() {
     fetchShow();
   }, [gameState?.show_id, currentShow]);
 
+  // Fetch timelines when game state changes to ensure they're loaded
+  useEffect(() => {
+    const refreshTimelines = async () => {
+      if (!lobby?.id || !playerId) return;
+      
+      console.log('[Game] Refreshing timelines due to game state change...');
+      const { data: timelinesData } = await supabase
+        .from('timelines')
+        .select('*')
+        .eq('lobby_id', lobby.id)
+        .order('year_value', { ascending: true });
+
+      if (timelinesData) {
+        const timelineMap = new Map<string, Timeline[]>();
+        for (const timeline of timelinesData) {
+          const existing = timelineMap.get(timeline.player_id) || [];
+          timelineMap.set(timeline.player_id, [...existing, timeline]);
+        }
+        setAllTimelines(timelineMap);
+        const myTimelineData = timelineMap.get(playerId) || [];
+        setMyTimeline(myTimelineData);
+        console.log('[Game] Timelines refreshed:', myTimelineData.length, 'years for me,', timelineMap.size, 'players total');
+      }
+    };
+
+    // Refresh timelines when game state round_state changes (e.g., dj_ready -> guessing)
+    if (gameState?.round_state) {
+      refreshTimelines();
+    }
+  }, [gameState?.round_state, lobby?.id, playerId]);
+
   // Calculate roles (before early return to avoid hook order issues)
   // Use useMemo to ensure consistent calculation
   const { myPlayer, mySeat, myName, isDj, isGuesser, isHost } = useMemo(() => {
     const foundPlayer = players.find(p => p.id === playerId);
     const seat = foundPlayer?.seat ?? null;
     const name = foundPlayer?.name || 'Unknown';
-    const dj = lobby && gameState && seat !== null && gameState.current_dj_seat === seat;
-    const guesser = lobby && gameState && seat !== null && gameState.current_attempt_seat === seat;
+    
+    // DJ = player whose seat matches current_dj_seat
+    const dj = lobby && gameState && seat !== null && gameState.current_dj_seat !== null && gameState.current_dj_seat === seat;
+    
+    // Guesser = player whose seat matches current_attempt_seat
+    const guesser = lobby && gameState && seat !== null && gameState.current_attempt_seat !== null && gameState.current_attempt_seat === seat;
+    
     const host = lobby && playerId && lobby.host_player_id === playerId;
+    
+    // Debug log when roles change
+    if (lobby && gameState && seat !== null) {
+      console.log('[Game] Role calculation:', {
+        myName: name,
+        mySeat: seat,
+        currentDjSeat: gameState.current_dj_seat,
+        currentAttemptSeat: gameState.current_attempt_seat,
+        isDj: dj,
+        isGuesser: guesser,
+        roundState: gameState.round_state
+      });
+    }
     
     return {
       myPlayer: foundPlayer,
@@ -395,12 +488,29 @@ export default function GamePage() {
 
   // Calculate timeline years (before early return)
   const sortedTimeline = useMemo(() => {
-    return [...myTimeline].sort((a, b) => a.year_value - b.year_value);
-  }, [myTimeline]);
+    if (!playerId) return [];
+    return [...(myTimeline || [])].sort((a, b) => a.year_value - b.year_value);
+  }, [myTimeline, playerId]);
   
   const uniqueYears = useMemo(() => {
     return [...new Set(sortedTimeline.map(t => t.year_value))];
   }, [sortedTimeline]);
+
+  // Debug: Verify player data is correct
+  useEffect(() => {
+    if (playerId && players.length > 0) {
+      const foundPlayer = players.find(p => p.id === playerId);
+      console.log('[Game] Player data verification:', {
+        playerId,
+        foundPlayer: foundPlayer ? { id: foundPlayer.id, name: foundPlayer.name, seat: foundPlayer.seat } : null,
+        myName,
+        mySeat,
+        timelineYears: uniqueYears,
+        timelineCount: myTimeline.length,
+        allPlayers: players.map(p => ({ id: p.id, name: p.name, seat: p.seat }))
+      });
+    }
+  }, [playerId, players, myName, mySeat, uniqueYears, myTimeline]);
 
   // Debug: Log player identification
   useEffect(() => {
@@ -446,10 +556,27 @@ export default function GamePage() {
     }
   }, [lobby, gameState, playerId, mySeat, isGuesser, isDj, isHost]);
 
+  // Redirect to lobby if game is finished (use useEffect to avoid render-time navigation)
+  useEffect(() => {
+    if (lobby && lobby.status === 'finished') {
+      console.log('[Game] Game finished, redirecting to lobby...');
+      router.push(`/lobby/${code}`);
+    }
+  }, [lobby?.status, code, router]);
+
   if (!lobby || !gameState || !playerId) {
     return (
       <div className="flex min-h-screen items-center justify-center">
         <p className="text-gray-600">Loading game...</p>
+      </div>
+    );
+  }
+
+  // Show redirecting message if game is finished
+  if (lobby.status === 'finished') {
+    return (
+      <div className="flex min-h-screen items-center justify-center">
+        <p className="text-gray-600">Game finished. Redirecting to lobby...</p>
       </div>
     );
   }
@@ -475,8 +602,11 @@ export default function GamePage() {
       if ('error' in result) {
         setError(result.error);
       } else {
-        // Success - manually refetch game state as fallback
-        console.log('[Game] DJ ready - refetching game state');
+        // Success - manually refetch game state and timelines as fallback
+        // This ensures immediate update even if realtime is slow
+        console.log('[Game] DJ ready - refetching game state and timelines');
+        
+        // Refetch game state
         const { data: updatedGameState } = await supabase
           .from('game_state')
           .select('*')
@@ -486,6 +616,27 @@ export default function GamePage() {
         if (updatedGameState) {
           console.log('[Game] Updated game state:', updatedGameState.round_state);
           setGameState(updatedGameState);
+        }
+
+        // Refetch timelines
+        const { data: timelinesData } = await supabase
+          .from('timelines')
+          .select('*')
+          .eq('lobby_id', lobby.id)
+          .order('year_value', { ascending: true });
+
+        if (timelinesData) {
+          const timelineMap = new Map<string, Timeline[]>();
+          for (const timeline of timelinesData) {
+            const existing = timelineMap.get(timeline.player_id) || [];
+            timelineMap.set(timeline.player_id, [...existing, timeline]);
+          }
+          setAllTimelines(timelineMap);
+          if (playerId) {
+            const myTimelineData = timelineMap.get(playerId) || [];
+            setMyTimeline(myTimelineData);
+            console.log('[Game] Timelines refreshed:', myTimelineData.length, 'years');
+          }
         }
       }
     } catch (err) {
@@ -497,51 +648,186 @@ export default function GamePage() {
   };
 
   const handleSubmitGuess = async () => {
-    if (selectedX === null) {
-      setError('Please select X year');
-      return;
-    }
+    if (!lobby || !playerId || !gameState) return;
 
-    if (guessType === 'between' && selectedY === null) {
-      setError('Please select Y year for between guess');
-      return;
-    }
+    // Determine guess type and values
+    let guessType: GuessType;
+    let xYear: number;
+    let yYear: number | null = null;
 
-    if (guessType === 'between' && selectedX >= selectedY!) {
-      setError('Y must be greater than X');
+    if (selectedBeforeYear !== null) {
+      guessType = 'before';
+      xYear = selectedBeforeYear;
+    } else if (selectedBetweenYears !== null) {
+      guessType = 'between';
+      xYear = selectedBetweenYears[0];
+      yYear = selectedBetweenYears[1];
+    } else if (selectedAfterYear !== null) {
+      guessType = 'after';
+      // For 'after', we pass the year as yYear
+      // The logic checks: premiere_year >= yYear (meaning after that year)
+      xYear = selectedAfterYear;
+      yYear = selectedAfterYear;
+    } else {
+      setError('Please select a guess');
       return;
     }
 
     setLoading(true);
     setError('');
 
-    const result = await submitAttempt(
-      lobby.id,
-      playerId,
-      guessType,
-      guessType === 'after' ? (selectedY ?? 0) : (selectedX ?? 0),
-      guessType === 'between' || guessType === 'after' ? selectedY : null
-    );
+    try {
+      console.log('[Game] Submitting guess:', { guessType, xYear, yYear });
+      const result = await submitAttempt(
+        lobby.id,
+        playerId,
+        guessType,
+        xYear,
+        yYear
+      );
 
-    setLoading(false);
+      if ('error' in result) {
+        setError(result.error);
+      } else {
+        // Success - reset selection
+        setSelectedBeforeYear(null);
+        setSelectedBetweenYears(null);
+        setSelectedAfterYear(null);
+        console.log('[Game] Guess submitted successfully:', result);
+        
+        // Manually refetch game state and timelines to ensure all players see the update
+        // This is similar to what we do for markDjReady
+        console.log('[Game] Refetching game state and timelines after guess...');
+        
+        // Refetch game state
+        const { data: updatedGameState } = await supabase
+          .from('game_state')
+          .select('*')
+          .eq('lobby_id', lobby.id)
+          .single();
+        
+        if (updatedGameState) {
+          console.log('[Game] Updated game state after guess:', {
+            round_state: updatedGameState.round_state,
+            current_attempt_seat: updatedGameState.current_attempt_seat,
+            isCorrect: result.isCorrect
+          });
+          setGameState(updatedGameState);
+        }
 
-    if ('error' in result) {
-      setError(result.error);
-    } else {
-      // Reset selection
-      setSelectedX(null);
-      setSelectedY(null);
+        // Refetch timelines (in case a correct guess added a year)
+        const { data: timelinesData } = await supabase
+          .from('timelines')
+          .select('*')
+          .eq('lobby_id', lobby.id)
+          .order('year_value', { ascending: true });
+
+        if (timelinesData) {
+          const timelineMap = new Map<string, Timeline[]>();
+          for (const timeline of timelinesData) {
+            const existing = timelineMap.get(timeline.player_id) || [];
+            timelineMap.set(timeline.player_id, [...existing, timeline]);
+          }
+          setAllTimelines(timelineMap);
+          if (playerId) {
+            const myTimelineData = timelineMap.get(playerId) || [];
+            setMyTimeline(myTimelineData);
+            console.log('[Game] Timelines refreshed after guess:', myTimelineData.length, 'years');
+          }
+        }
+
+        // Refetch attempts to show the new attempt
+        if (updatedGameState) {
+          const { data: attemptsData } = await supabase
+            .from('attempts')
+            .select('*')
+            .eq('lobby_id', lobby.id)
+            .eq('round_number', updatedGameState.current_round_number)
+            .order('attempt_order', { ascending: true });
+
+          if (attemptsData) {
+            setAttempts(attemptsData);
+            console.log('[Game] Attempts refreshed:', attemptsData.length);
+          }
+        }
+      }
+    } catch (err) {
+      console.error('[Game] Error submitting guess:', err);
+      setError('Failed to submit guess. Please try again.');
+    } finally {
+      setLoading(false);
     }
   };
 
   const handleAdvanceRound = async () => {
-    if (!isHost) return;
+    if (!isHost || !lobby || !playerId) return;
     setLoading(true);
     setError('');
-    const result = await advanceRound(lobby.id, playerId);
-    setLoading(false);
-    if ('error' in result) {
-      setError(result.error);
+    
+    try {
+      const result = await advanceRound(lobby.id, playerId);
+      
+      if ('error' in result) {
+        setError(result.error);
+      } else {
+        // Success - manually refetch game state, show, and timelines
+        console.log('[Game] Round advanced - refetching game state...');
+        
+        // Refetch game state
+        const { data: updatedGameState } = await supabase
+          .from('game_state')
+          .select('*')
+          .eq('lobby_id', lobby.id)
+          .single();
+        
+        if (updatedGameState) {
+          console.log('[Game] Updated game state after advance:', {
+            round_state: updatedGameState.round_state,
+            current_round_number: updatedGameState.current_round_number
+          });
+          setGameState(updatedGameState);
+          
+          // Fetch new show
+          if (updatedGameState.show_id) {
+            const { data: showData } = await supabase
+              .from('shows')
+              .select('*')
+              .eq('id', updatedGameState.show_id)
+              .single();
+            if (showData) {
+              setCurrentShow(showData);
+            }
+          }
+        }
+
+        // Refetch timelines
+        const { data: timelinesData } = await supabase
+          .from('timelines')
+          .select('*')
+          .eq('lobby_id', lobby.id)
+          .order('year_value', { ascending: true });
+
+        if (timelinesData) {
+          const timelineMap = new Map<string, Timeline[]>();
+          for (const timeline of timelinesData) {
+            const existing = timelineMap.get(timeline.player_id) || [];
+            timelineMap.set(timeline.player_id, [...existing, timeline]);
+          }
+          setAllTimelines(timelineMap);
+          if (playerId) {
+            const myTimelineData = timelineMap.get(playerId) || [];
+            setMyTimeline(myTimelineData);
+          }
+        }
+
+        // Clear attempts for new round
+        setAttempts([]);
+      }
+    } catch (err) {
+      console.error('[Game] Error advancing round:', err);
+      setError('Failed to advance round. Please try again.');
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -566,8 +852,9 @@ export default function GamePage() {
               <p className="text-sm text-gray-600">Target: {lobby.target_score} years</p>
             </div>
             <div className="text-right">
-              <p className="text-sm text-gray-600">{myName}</p>
+              <p className="text-sm font-medium text-gray-700">{myName || 'Unknown Player'}</p>
               <p className="text-2xl font-bold text-purple-600">{getPlayerScore(playerId)}</p>
+              <p className="text-xs text-gray-500">Score</p>
             </div>
           </div>
         </div>
@@ -608,14 +895,14 @@ export default function GamePage() {
               .map((player) => {
                 const isCurrentlyGuessing = gameState.round_state === 'guessing' && 
                   player.seat === gameState.current_attempt_seat;
-                const isDj = player.seat === gameState.current_dj_seat;
+                const playerIsDj = player.seat === gameState.current_dj_seat;
                 
                 return (
                   <div 
                     key={player.id} 
                     className={`flex items-center justify-between rounded-lg p-2 ${
                       isCurrentlyGuessing ? 'bg-purple-100 border-2 border-purple-500' : 
-                      isDj ? 'bg-blue-50' : ''
+                      playerIsDj ? 'bg-blue-50' : ''
                     }`}
                   >
                     <div className="flex items-center gap-2">
@@ -633,7 +920,7 @@ export default function GamePage() {
                           Guessing
                         </span>
                       )}
-                      {isDj && !isCurrentlyGuessing && (
+                      {playerIsDj && !isCurrentlyGuessing && (
                         <span className="text-xs font-medium text-blue-600 bg-blue-200 px-2 py-0.5 rounded">
                           DJ
                         </span>
@@ -653,7 +940,13 @@ export default function GamePage() {
         )}
 
         {/* DJ Interface */}
-        {isDj && gameState.round_state === 'dj_ready' && (
+        {(() => {
+          const shouldShowDj = isDj && gameState.round_state === 'dj_ready';
+          if (shouldShowDj) {
+            console.log('[Game] Showing DJ interface for:', { mySeat, currentDjSeat: gameState.current_dj_seat, myName });
+          }
+          return shouldShowDj;
+        })() && (
           <div className="rounded-2xl bg-white p-4 shadow-lg border-2 border-blue-500">
             <h2 className="mb-3 text-lg font-semibold text-gray-900">DJ - Play the Theme Song</h2>
             {currentShow ? (
@@ -715,152 +1008,148 @@ export default function GamePage() {
           </div>
         )}
 
-        {/* Guesser Interface */}
+        {/* Guesser Interface - Timeline Based */}
         {(() => {
           const shouldShow = isGuesser && gameState.round_state === 'guessing';
-          if (!shouldShow && gameState.round_state === 'guessing') {
-            console.log('[Game] NOT showing guesser UI because:', {
-              isGuesser,
-              mySeat,
-              currentAttemptSeat: gameState.current_attempt_seat,
-              roundState: gameState.round_state,
-              match: mySeat === gameState.current_attempt_seat
-            });
+          if (shouldShow) {
+            console.log('[Game] Showing Guesser interface for:', { mySeat, currentAttemptSeat: gameState.current_attempt_seat, myName });
           }
           return shouldShow;
         })() ? (
           <div className="rounded-2xl bg-white p-4 shadow-lg border-2 border-purple-500">
             <h2 className="mb-3 text-lg font-semibold text-gray-900">Your Turn to Guess</h2>
-            <p className="mb-3 text-sm text-gray-600">Select a range placement using your timeline years below.</p>
-            <p className="mb-3 text-xs text-gray-500">Your seat: {mySeat} | Attempting: {gameState.current_attempt_seat}</p>
+            <p className="mb-3 text-sm text-gray-600">Select where you think the show premiered relative to your timeline.</p>
 
-            {/* Guess Type Selection */}
-            <div className="mb-4">
-              <label className="block text-sm font-medium text-gray-700 mb-2">Guess Type</label>
-              <div className="flex gap-2">
-                <button
-                  onClick={() => {
-                    setGuessType('before');
-                    setSelectedY(null);
-                  }}
-                  className={`flex-1 rounded-lg px-4 py-2 font-medium transition-colors ${
-                    guessType === 'before'
-                      ? 'bg-purple-600 text-white'
-                      : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                  }`}
-                >
-                  Before X
-                </button>
-                <button
-                  onClick={() => setGuessType('between')}
-                  className={`flex-1 rounded-lg px-4 py-2 font-medium transition-colors ${
-                    guessType === 'between'
-                      ? 'bg-purple-600 text-white'
-                      : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                  }`}
-                >
-                  Between X & Y
-                </button>
-                <button
-                  onClick={() => {
-                    setGuessType('after');
-                    setSelectedX(null);
-                  }}
-                  className={`flex-1 rounded-lg px-4 py-2 font-medium transition-colors ${
-                    guessType === 'after'
-                      ? 'bg-purple-600 text-white'
-                      : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                  }`}
-                >
-                  After Y
-                </button>
+            {uniqueYears.length === 0 ? (
+              <div className="rounded-lg bg-yellow-50 border border-yellow-200 p-3">
+                <p className="text-sm text-yellow-800">
+                  No years in your timeline yet. You should have 2 starting years. Please refresh the page.
+                </p>
               </div>
-            </div>
-
-            {/* Timeline Display */}
-            <div className="mb-4">
-              <label className="block text-sm font-medium text-gray-700 mb-2">Your Timeline</label>
-              {uniqueYears.length === 0 ? (
-                <div className="rounded-lg bg-yellow-50 border border-yellow-200 p-3">
-                  <p className="text-sm text-yellow-800">
-                    No years in your timeline yet. You should have 2 starting years. Please refresh the page.
-                  </p>
-                </div>
-              ) : (
-                <div className="flex flex-wrap gap-2">
-                  {uniqueYears.map((year) => (
+            ) : (
+              <>
+                {/* Timeline Display - Horizontal with buttons */}
+                <div className="mb-4">
+                  <label className="block text-sm font-medium text-gray-700 mb-3">Your Timeline</label>
+                  <div className="flex items-center gap-2 flex-wrap justify-center">
+                    {/* Before first year button */}
                     <button
-                      key={year}
                       onClick={() => {
-                        if (guessType === 'after') {
-                          setSelectedY(year);
-                        } else if (guessType === 'between') {
-                          if (selectedX === null) {
-                            setSelectedX(year);
-                          } else if (selectedX === year) {
-                            setSelectedX(null);
-                          } else if (year > selectedX) {
-                            setSelectedY(year);
-                          } else {
-                            setSelectedX(year);
-                            setSelectedY(null);
-                          }
-                        } else {
-                          setSelectedX(year);
-                        }
+                        setSelectedBeforeYear(uniqueYears[0]);
+                        setSelectedBetweenYears(null);
+                        setSelectedAfterYear(null);
                       }}
-                      className={`rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
-                        (guessType === 'after' && selectedY === year) ||
-                        (guessType === 'between' && (selectedX === year || selectedY === year)) ||
-                        (guessType === 'before' && selectedX === year)
+                      className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                        selectedBeforeYear === uniqueYears[0]
                           ? 'bg-purple-600 text-white'
                           : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
                       }`}
                     >
-                      {year}
+                      &lt; {uniqueYears[0]}
                     </button>
-                  ))}
+
+                    {/* Years with between selection */}
+                    {uniqueYears.map((year, index) => {
+                      const isFirst = index === 0;
+                      const isLast = index === uniqueYears.length - 1;
+                      const nextYear = uniqueYears[index + 1];
+                      const isSelectedInBetween = selectedBetweenYears && 
+                        (selectedBetweenYears[0] === year || selectedBetweenYears[1] === year);
+                      const canSelectAsBetween = !isLast && nextYear;
+
+                      return (
+                        <div key={year} className="flex items-center gap-1">
+                          <button
+                            onClick={() => {
+                              if (canSelectAsBetween) {
+                                // Toggle between selection
+                                if (selectedBetweenYears && selectedBetweenYears[0] === year && selectedBetweenYears[1] === nextYear) {
+                                  // Deselect if already selected
+                                  setSelectedBetweenYears(null);
+                                } else if (selectedBetweenYears && selectedBetweenYears[0] === year) {
+                                  // Already have first year, set second
+                                  setSelectedBetweenYears([year, nextYear]);
+                                } else {
+                                  // Start new selection
+                                  setSelectedBetweenYears([year, nextYear]);
+                                }
+                                setSelectedBeforeYear(null);
+                                setSelectedAfterYear(null);
+                              }
+                            }}
+                            className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                              isSelectedInBetween
+                                ? 'bg-purple-600 text-white'
+                                : canSelectAsBetween
+                                ? 'bg-blue-100 text-blue-700 hover:bg-blue-200'
+                                : 'bg-gray-100 text-gray-700'
+                            }`}
+                            disabled={!canSelectAsBetween}
+                          >
+                            {year}
+                          </button>
+                          {!isLast && (
+                            <span className="text-gray-400">—</span>
+                          )}
+                        </div>
+                      );
+                    })}
+
+                    {/* After last year button */}
+                    <button
+                      onClick={() => {
+                        setSelectedAfterYear(uniqueYears[uniqueYears.length - 1]);
+                        setSelectedBeforeYear(null);
+                        setSelectedBetweenYears(null);
+                      }}
+                      className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                        selectedAfterYear === uniqueYears[uniqueYears.length - 1]
+                          ? 'bg-purple-600 text-white'
+                          : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                      }`}
+                    >
+                      {uniqueYears[uniqueYears.length - 1]} &lt;=
+                    </button>
+                  </div>
                 </div>
-              )}
-            </div>
 
-            {/* Selection Display */}
-            {guessType === 'before' && selectedX !== null && (
-              <div className="mb-4 rounded-lg bg-purple-50 p-3">
-                <p className="text-sm text-gray-700">
-                  Guessing: <span className="font-semibold">Before {selectedX}</span>
-                </p>
-              </div>
+                {/* Selection Display */}
+                {selectedBeforeYear !== null && (
+                  <div className="mb-4 rounded-lg bg-purple-50 p-3">
+                    <p className="text-sm text-gray-700">
+                      Guessing: <span className="font-semibold">Before {selectedBeforeYear}</span>
+                    </p>
+                  </div>
+                )}
+
+                {selectedBetweenYears !== null && (
+                  <div className="mb-4 rounded-lg bg-purple-50 p-3">
+                    <p className="text-sm text-gray-700">
+                      Guessing: <span className="font-semibold">Between {selectedBetweenYears[0]} and {selectedBetweenYears[1]}</span>
+                    </p>
+                  </div>
+                )}
+
+                {selectedAfterYear !== null && (
+                  <div className="mb-4 rounded-lg bg-purple-50 p-3">
+                    <p className="text-sm text-gray-700">
+                      Guessing: <span className="font-semibold">After {selectedAfterYear}</span>
+                    </p>
+                  </div>
+                )}
+
+                <button
+                  onClick={handleSubmitGuess}
+                  disabled={
+                    loading ||
+                    (selectedBeforeYear === null && selectedBetweenYears === null && selectedAfterYear === null)
+                  }
+                  className="w-full rounded-lg bg-purple-600 px-4 py-3 font-medium text-white transition-colors hover:bg-purple-700 disabled:opacity-50"
+                >
+                  {loading ? 'Submitting...' : 'Submit Guess'}
+                </button>
+              </>
             )}
-
-            {guessType === 'between' && selectedX !== null && selectedY !== null && (
-              <div className="mb-4 rounded-lg bg-purple-50 p-3">
-                <p className="text-sm text-gray-700">
-                  Guessing: <span className="font-semibold">Between {selectedX} and {selectedY}</span>
-                </p>
-              </div>
-            )}
-
-            {guessType === 'after' && selectedY !== null && (
-              <div className="mb-4 rounded-lg bg-purple-50 p-3">
-                <p className="text-sm text-gray-700">
-                  Guessing: <span className="font-semibold">After {selectedY}</span>
-                </p>
-              </div>
-            )}
-
-            <button
-              onClick={handleSubmitGuess}
-              disabled={
-                loading ||
-                (guessType === 'before' && selectedX === null) ||
-                (guessType === 'between' && (selectedX === null || selectedY === null)) ||
-                (guessType === 'after' && selectedY === null)
-              }
-              className="w-full rounded-lg bg-purple-600 px-4 py-3 font-medium text-white transition-colors hover:bg-purple-700 disabled:opacity-50"
-            >
-              {loading ? 'Submitting...' : 'Submit Guess'}
-            </button>
           </div>
         ) : gameState.round_state === 'guessing' && !isGuesser ? (
           <div className="rounded-2xl bg-white p-4 shadow-lg border-2 border-gray-200">
@@ -886,10 +1175,10 @@ export default function GamePage() {
           </div>
         ) : null}
 
-        {/* Attempts List */}
+        {/* Attempts List - Show all attempts with results */}
         {attempts.length > 0 && (
           <div className="rounded-2xl bg-white p-4 shadow-lg">
-            <h2 className="mb-2 text-lg font-semibold text-gray-900">Attempts</h2>
+            <h2 className="mb-3 text-lg font-semibold text-gray-900">Attempts (Round {gameState.current_round_number})</h2>
             <div className="space-y-2">
               {attempts.map((attempt) => {
                 const player = players.find(p => p.id === attempt.player_id);
@@ -903,7 +1192,7 @@ export default function GamePage() {
                 return (
                   <div
                     key={attempt.id}
-                    className={`rounded-lg border-2 p-2 ${
+                    className={`rounded-lg border-2 p-3 ${
                       attempt.is_correct === true
                         ? 'border-green-500 bg-green-50'
                         : attempt.is_correct === false
@@ -911,19 +1200,21 @@ export default function GamePage() {
                         : 'border-gray-200 bg-gray-50'
                     }`}
                   >
-                    <div className="flex items-center justify-between">
-                      <span className="font-medium text-gray-900">{player?.name}</span>
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-semibold text-gray-900">{player?.name || 'Unknown'}</span>
                       {attempt.is_correct !== null && (
                         <span
-                          className={`text-sm font-semibold ${
-                            attempt.is_correct ? 'text-green-600' : 'text-red-600'
+                          className={`text-sm font-bold px-2 py-1 rounded ${
+                            attempt.is_correct 
+                              ? 'text-green-700 bg-green-100' 
+                              : 'text-red-700 bg-red-100'
                           }`}
                         >
-                          {attempt.is_correct ? '✓ Correct' : '✗ Wrong'}
+                          {attempt.is_correct ? '✓ Correct!' : '✗ Wrong'}
                         </span>
                       )}
                     </div>
-                    <p className="text-sm text-gray-600">{guessText}</p>
+                    <p className="text-sm font-medium text-gray-700">Guessed: {guessText}</p>
                   </div>
                 );
               })}
@@ -941,7 +1232,16 @@ export default function GamePage() {
               <p className="text-sm text-gray-600">Artist: {currentShow.artist}</p>
               <p className="text-xl font-bold text-purple-600">Premiered: {currentShow.premiere_year}</p>
             </div>
-            {isHost && (
+            {lobby.status === 'finished' ? (
+              // Game is over - show return to lobby button for everyone
+              <button
+                onClick={() => router.push(`/lobby/${code}`)}
+                className="mt-4 w-full rounded-lg bg-purple-600 px-4 py-3 font-medium text-white transition-colors hover:bg-purple-700"
+              >
+                Return to Lobby
+              </button>
+            ) : isHost ? (
+              // Game still in progress - host can advance round
               <button
                 onClick={handleAdvanceRound}
                 disabled={loading}
@@ -949,9 +1249,11 @@ export default function GamePage() {
               >
                 {loading ? 'Loading...' : 'Next Round'}
               </button>
-            )}
-            {!isHost && (
-              <p className="mt-4 text-center text-sm text-gray-600">Waiting for host to start next round...</p>
+            ) : (
+              // Non-host waiting for next round
+              <div className="mt-4 rounded-lg bg-blue-50 p-3 text-center text-sm text-gray-700">
+                Waiting for host to start next round...
+              </div>
             )}
           </div>
         )}

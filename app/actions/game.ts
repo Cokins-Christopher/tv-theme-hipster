@@ -20,6 +20,22 @@ export async function startGame(lobbyId: string, hostPlayerId: string): Promise<
       return { error: 'Target score must be set before starting' };
     }
 
+    // Clear previous game data if starting a new game
+    await supabaseAdmin
+      .from('timelines')
+      .delete()
+      .eq('lobby_id', lobbyId);
+    
+    await supabaseAdmin
+      .from('attempts')
+      .delete()
+      .eq('lobby_id', lobbyId);
+    
+    await supabaseAdmin
+      .from('game_state')
+      .delete()
+      .eq('lobby_id', lobbyId);
+
     // Get all players
     const { data: players, error: playersError } = await supabaseAdmin
       .from('players')
@@ -46,7 +62,7 @@ export async function startGame(lobbyId: string, hostPlayerId: string): Promise<
         .eq('id', assignment.playerId);
     }
 
-    // Get 2 random starting years (same for all players)
+    // Get unique years from shows - each player gets DIFFERENT starting years
     const { data: shows, error: showsError } = await supabaseAdmin
       .from('shows')
       .select('premiere_year')
@@ -62,13 +78,41 @@ export async function startGame(lobbyId: string, hostPlayerId: string): Promise<
       return { error: `Not enough shows in database. Found ${shows?.length || 0} shows, need at least 2. Make sure you ran the seed.sql file.` };
     }
 
-    const shuffledYears = [...new Set(shows.map(s => s.premiere_year))]
-      .sort(() => Math.random() - 0.5)
-      .slice(0, 2);
+    // Get unique years and shuffle
+    const uniqueYears = [...new Set(shows.map(s => s.premiere_year))];
+    const minYearsNeeded = players.length * 2;
+    
+    if (uniqueYears.length < minYearsNeeded) {
+      return { error: `Not enough unique years. Need at least ${minYearsNeeded} unique years for ${players.length} players, found ${uniqueYears.length}` };
+    }
 
-    // Insert starting years for all players
-    for (const player of players) {
-      for (const year of shuffledYears) {
+    const shuffledYears = [...uniqueYears].sort(() => Math.random() - 0.5);
+
+    // Give each player 2 DIFFERENT random starting years
+    for (let i = 0; i < players.length; i++) {
+      const player = players[i];
+      // Each player gets 2 unique years from different positions in the shuffled array
+      const yearIndex1 = i * 2;
+      const yearIndex2 = (i * 2) + 1;
+      
+      const playerYears = [
+        shuffledYears[yearIndex1 % shuffledYears.length],
+        shuffledYears[yearIndex2 % shuffledYears.length]
+      ];
+      
+      // Ensure we have 2 unique years (in case of wrap-around collision)
+      const uniquePlayerYears = [...new Set(playerYears)];
+      if (uniquePlayerYears.length < 2) {
+        // Find a different year if we got a duplicate
+        for (let j = 0; j < shuffledYears.length && uniquePlayerYears.length < 2; j++) {
+          if (!uniquePlayerYears.includes(shuffledYears[j])) {
+            uniquePlayerYears.push(shuffledYears[j]);
+          }
+        }
+      }
+      
+      // Insert starting years for this player
+      for (const year of uniquePlayerYears.slice(0, 2)) {
         await supabaseAdmin
           .from('timelines')
           .insert({
@@ -77,6 +121,8 @@ export async function startGame(lobbyId: string, hostPlayerId: string): Promise<
             year_value: year,
           });
       }
+      
+      console.log(`[startGame] Player ${i} (${player.id}) got starting years:`, uniquePlayerYears.slice(0, 2));
     }
 
     // Get a random show for first round
@@ -260,6 +306,9 @@ export async function submitAttempt(
         })
         .eq('lobby_id', lobbyId);
 
+      // Revalidate to ensure all players see the reveal
+      revalidatePath(`/game/[code]`, 'page');
+
       return { success: true, isCorrect: true };
     } else {
       // Move to next player (clockwise = seat + 1, wrapping)
@@ -294,6 +343,9 @@ export async function submitAttempt(
           })
           .eq('lobby_id', lobbyId);
       }
+
+      // Revalidate to ensure all players see the update
+      revalidatePath(`/game/[code]`, 'page');
 
       return { success: true, isCorrect: false };
     }
@@ -374,23 +426,43 @@ export async function advanceRound(lobbyId: string, hostPlayerId: string): Promi
 
     const randomShow = showsToUse[Math.floor(Math.random() * showsToUse.length)];
 
-    // Advance guesser (clockwise)
-    const currentGuesserSeat = gameState.current_guesser_seat ?? 0;
-    const nextGuesserSeat = (currentGuesserSeat + 1) % players.length;
-    const nextDjSeat = (nextGuesserSeat + 1) % players.length;
+    // The new DJ should be whoever just guessed correctly (the person who made the correct attempt)
+    // The new guesser should be the person right after the new DJ
+    // IMPORTANT: Use current_attempt_seat (who actually guessed) not current_guesser_seat (original guesser)
+    // because if the original guesser was wrong, the attempt moved to the next player
+    const previousAttemptSeat = gameState.current_attempt_seat ?? gameState.current_guesser_seat ?? 0;
+    const newDjSeat = previousAttemptSeat; // DJ is the person who just guessed correctly
+    const newGuesserSeat = (newDjSeat + 1) % players.length; // Guesser is right after the DJ
+
+    console.log('[advanceRound] Role assignment:', {
+      previousAttemptSeat,
+      previousGuesserSeat: gameState.current_guesser_seat,
+      currentAttemptSeat: gameState.current_attempt_seat,
+      newDjSeat,
+      newGuesserSeat,
+      playersCount: players.length
+    });
 
     // Update game state
-    await supabaseAdmin
+    const { error: updateError } = await supabaseAdmin
       .from('game_state')
       .update({
         current_round_number: gameState.current_round_number + 1,
-        current_guesser_seat: nextGuesserSeat,
-        current_dj_seat: nextDjSeat,
-        current_attempt_seat: nextGuesserSeat,
+        current_guesser_seat: newGuesserSeat,
+        current_dj_seat: newDjSeat,
+        current_attempt_seat: newGuesserSeat,
         show_id: randomShow.id,
         round_state: 'dj_ready',
       })
       .eq('lobby_id', lobbyId);
+
+    if (updateError) {
+      console.error('[advanceRound] Error updating game state:', updateError);
+      return { error: updateError.message || 'Failed to advance round' };
+    }
+
+    // Revalidate the game page to ensure all players see the update
+    revalidatePath(`/game/[code]`, 'page');
 
     return { success: true };
   } catch (error) {
@@ -429,10 +501,18 @@ export async function markDjReady(lobbyId: string, playerId: string): Promise<{ 
     }
 
     // Update round state to guessing
-    await supabaseAdmin
+    const { error: updateError } = await supabaseAdmin
       .from('game_state')
       .update({ round_state: 'guessing' })
       .eq('lobby_id', lobbyId);
+
+    if (updateError) {
+      console.error('[markDjReady] Error updating game state:', updateError);
+      return { error: updateError.message || 'Failed to update game state' };
+    }
+
+    // Revalidate the game page to ensure all players see the update
+    revalidatePath(`/game/[code]`, 'page');
 
     return { success: true };
   } catch (error) {

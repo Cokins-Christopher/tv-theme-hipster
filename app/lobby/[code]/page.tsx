@@ -6,7 +6,7 @@ import { supabase } from '@/lib/supabase/client';
 import { setTargetScore as setTargetScoreAction } from '@/app/actions/lobby';
 import { startGame } from '@/app/actions/game';
 import { getPlayerId } from '@/lib/utils/player';
-import type { Lobby, Player } from '@/lib/types';
+import type { Lobby, Player, Timeline } from '@/lib/types';
 
 export default function LobbyPage() {
   const params = useParams();
@@ -19,6 +19,8 @@ export default function LobbyPage() {
   const [customScore, setCustomScore] = useState<string>('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [allTimelines, setAllTimelines] = useState<Map<string, Timeline[]>>(new Map());
+  const [winnerId, setWinnerId] = useState<string | null>(null);
 
   useEffect(() => {
     const id = getPlayerId();
@@ -48,6 +50,43 @@ export default function LobbyPage() {
       if (playersData) {
         console.log('[Lobby] Players fetched:', playersData.length);
         setPlayers(playersData);
+      }
+    };
+
+    // Fetch timelines and determine winner
+    const fetchTimelinesAndWinner = async (lobbyIdToFetch: string) => {
+      console.log('[Lobby] Fetching timelines for scoreboard:', lobbyIdToFetch);
+      const { data: timelinesData, error } = await supabase
+        .from('timelines')
+        .select('*')
+        .eq('lobby_id', lobbyIdToFetch)
+        .order('year_value', { ascending: true });
+
+      if (error) {
+        console.error('[Lobby] Error fetching timelines:', error);
+        return;
+      }
+
+      if (timelinesData) {
+        // Group timelines by player
+        const timelineMap = new Map<string, Timeline[]>();
+        for (const timeline of timelinesData) {
+          const existing = timelineMap.get(timeline.player_id) || [];
+          timelineMap.set(timeline.player_id, [...existing, timeline]);
+        }
+        setAllTimelines(timelineMap);
+
+        // Find winner (player with most timeline entries)
+        let maxScore = 0;
+        let winnerIdFound: string | null = null;
+        for (const [playerId, timelines] of timelineMap.entries()) {
+          if (timelines.length > maxScore) {
+            maxScore = timelines.length;
+            winnerIdFound = playerId;
+          }
+        }
+        setWinnerId(winnerIdFound);
+        console.log('[Lobby] Winner found:', winnerIdFound, 'with score:', maxScore);
       }
     };
 
@@ -103,9 +142,14 @@ export default function LobbyPage() {
         await fetchPlayers(lobbyData.id);
         setupPlayersSubscription(lobbyData.id);
 
-        // Redirect if game started
-        if (lobbyData.status === 'playing' || lobbyData.status === 'finished') {
+        // Redirect if game started (but not if finished - show scoreboard)
+        if (lobbyData.status === 'playing') {
           router.push(`/game/${code}`);
+        }
+        
+        // If game is finished, fetch timelines for scoreboard
+        if (lobbyData.status === 'finished') {
+          await fetchTimelinesAndWinner(lobbyData.id);
         }
       }
     };
@@ -147,8 +191,13 @@ export default function LobbyPage() {
               await fetchPlayers(updatedLobby.id);
             }
             
-            if (updatedLobby.status === 'playing' || updatedLobby.status === 'finished') {
+            if (updatedLobby.status === 'playing') {
               router.push(`/game/${code}`);
+            }
+            
+            // If finished, fetch timelines for scoreboard
+            if (updatedLobby.status === 'finished') {
+              await fetchTimelinesAndWinner(updatedLobby.id);
             }
           }
         }
@@ -231,6 +280,12 @@ export default function LobbyPage() {
     setError('');
 
     try {
+      // Clear local state if starting a new game
+      if (lobby.status === 'finished') {
+        setAllTimelines(new Map());
+        setWinnerId(null);
+      }
+
       const result = await startGame(lobby.id, playerId!);
       setLoading(false);
 
@@ -375,9 +430,116 @@ export default function LobbyPage() {
           </div>
         )}
 
-        {!isHost && (
+        {!isHost && lobby.status === 'waiting' && (
           <div className="rounded-lg bg-blue-50 p-4 text-center text-gray-700">
             <p>Waiting for host to start the game...</p>
+          </div>
+        )}
+
+        {/* Scoreboard - Show when game is finished */}
+        {lobby.status === 'finished' && (
+          <div className="space-y-4 rounded-lg border-2 border-purple-200 bg-purple-50 p-4">
+            <h2 className="text-2xl font-bold text-gray-900">Game Over!</h2>
+            
+            {/* Winner */}
+            {winnerId && (
+              <div className="rounded-lg border-2 border-yellow-400 bg-yellow-50 p-4">
+                <p className="text-sm font-medium text-gray-700 mb-1">Winner</p>
+                <p className="text-2xl font-bold text-yellow-700">
+                  {players.find(p => p.id === winnerId)?.name || 'Unknown'}
+                </p>
+                <p className="text-sm text-gray-600 mt-1">
+                  Score: {allTimelines.get(winnerId)?.length || 0} years
+                </p>
+              </div>
+            )}
+
+            {/* Scoreboard */}
+            <div>
+              <h3 className="mb-3 text-lg font-semibold text-gray-900">Final Scores</h3>
+              <div className="space-y-2">
+                {players
+                  .map(player => ({
+                    player,
+                    score: allTimelines.get(player.id)?.length || 0,
+                    timeline: allTimelines.get(player.id) || []
+                  }))
+                  .sort((a, b) => b.score - a.score) // Sort by score descending
+                  .map(({ player, score, timeline }) => {
+                    const isWinner = player.id === winnerId;
+                    const sortedYears = [...timeline].sort((a, b) => a.year_value - b.year_value);
+                    const uniqueYears = [...new Set(sortedYears.map(t => t.year_value))];
+
+                    return (
+                      <div
+                        key={player.id}
+                        className={`rounded-lg border-2 p-3 ${
+                          isWinner
+                            ? 'border-yellow-400 bg-yellow-50'
+                            : 'border-gray-200 bg-white'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-2">
+                          <div className="flex items-center gap-2">
+                            <span className="font-semibold text-gray-900">{player.name}</span>
+                            {isWinner && (
+                              <span className="rounded-full bg-yellow-400 px-2 py-1 text-xs font-bold text-yellow-900">
+                                🏆 Winner
+                              </span>
+                            )}
+                          </div>
+                          <span className="text-lg font-bold text-purple-600">{score}</span>
+                        </div>
+                        <div className="mt-2">
+                          <p className="text-xs font-medium text-gray-600 mb-1">Timeline:</p>
+                          <div className="flex flex-wrap gap-1">
+                            {uniqueYears.length > 0 ? (
+                              uniqueYears.map((year) => (
+                                <span
+                                  key={year}
+                                  className="rounded bg-purple-100 px-2 py-1 text-xs font-medium text-purple-700"
+                                >
+                                  {year}
+                                </span>
+                              ))
+                            ) : (
+                              <span className="text-xs text-gray-500">No years yet</span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+              </div>
+            </div>
+
+            {/* Restart game button (host only) */}
+            {isHost && (
+              <button
+                onClick={async () => {
+                  // Reset lobby status back to waiting
+                  setLoading(true);
+                  const { error } = await supabase
+                    .from('lobbies')
+                    .update({ status: 'waiting' })
+                    .eq('id', lobby.id);
+                  
+                  if (error) {
+                    setError('Failed to reset game. Please try again.');
+                  } else {
+                    // Clear timelines and winner
+                    setAllTimelines(new Map());
+                    setWinnerId(null);
+                    // Lobby status will update via realtime subscription
+                  }
+                  setLoading(false);
+                }}
+                disabled={loading}
+                className="w-full rounded-lg bg-purple-600 px-4 py-3 font-medium text-white transition-colors hover:bg-purple-700 disabled:opacity-50"
+              >
+                {loading ? 'Resetting...' : 'Start New Game'}
+              </button>
+            )}
           </div>
         )}
       </div>
