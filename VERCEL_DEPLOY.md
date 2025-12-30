@@ -53,9 +53,15 @@ Vercel should auto-detect:
 
 ### 5. Verify Deployment
 
+**Build Checks:**
+- The build will automatically run `prebuild` script that checks all env vars
+- If any are missing, the build will fail with clear error messages
+- Check build logs to see which variables are set/missing
+
 **Health Check:**
 - Visit `https://your-project.vercel.app/api/health`
 - Should return: `{ "ok": true, "timestamp": "...", "service": "tv-theme-hipster" }`
+- Vercel will automatically monitor this endpoint (configured in `vercel.json`)
 
 **Test Game Flow:**
 1. Open the deployed URL

@@ -1,0 +1,11 @@
+{
+  "healthCheck": {
+    "path": "/api/health",
+    "interval": 60,
+    "timeout": 10
+  },
+  "buildCommand": "npm run build",
+  "devCommand": "npm run dev",
+  "installCommand": "npm install"
+}
+
