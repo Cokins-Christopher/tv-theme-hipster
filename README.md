@@ -1,110 +1,178 @@
-# TV Theme Hipster
+# TV Theme Hipster 🎵
 
-A multiplayer party game where players guess when TV show theme songs premiered by placing years on their personal timeline.
+A multiplayer party game inspired by "Hipster" where players guess when TV show theme songs premiered by placing years on their personal timeline. No exact year guessing required—just relative placement!
 
-## Tech Stack
+## 🎮 What is This Game?
 
-- **Next.js 14+** (App Router)
-- **TypeScript**
-- **Tailwind CSS**
-- **Supabase** (PostgreSQL + Realtime)
+**TV Theme Hipster** is a real-time multiplayer web game where:
 
-## Setup Instructions
+- Players listen to TV show theme songs
+- Each player has a personal timeline of premiere years
+- Players guess where a show's premiere year fits relative to their timeline
+- First player to reach the target score wins!
 
-### 1. Install Dependencies
+### How It Works
 
-```bash
-npm install
-```
+1. **Timeline-Based Guessing**: Instead of guessing exact years, players place shows relative to years they already have
+2. **Relative Placement**: Choose "Before X", "Between X and Y", or "After Y"
+3. **Progressive Scoring**: Correct guesses add the show's year to your timeline, expanding your knowledge
+4. **Real-Time Multiplayer**: All players see updates instantly via Supabase Realtime
 
-### 2. Set Up Supabase
+## 🚀 Quick Start
 
-1. Create a new project at [supabase.com](https://supabase.com)
-2. Go to the SQL Editor in your Supabase dashboard
-3. Run the schema file:
-   - Copy and paste the contents of `supabase/schema.sql` into the SQL Editor
-   - Click "Run" to execute
-4. Seed the database:
-   - Copy and paste the contents of `supabase/seed.sql` into the SQL Editor
-   - Click "Run" to execute
+### Prerequisites
 
-### 3. Configure Environment Variables
+- Node.js 18+ and npm
+- A Supabase account (free tier works)
 
-Create a `.env.local` file in the root directory:
+### Installation
 
-```env
-NEXT_PUBLIC_SUPABASE_URL=your_supabase_project_url
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key
-SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
-```
+1. **Clone the repository**
 
-**Where to find these values:**
-- Go to your Supabase project dashboard
-- Navigate to Settings → API
-- `NEXT_PUBLIC_SUPABASE_URL` = Project URL
-- `NEXT_PUBLIC_SUPABASE_ANON_KEY` = anon/public key
-- `SUPABASE_SERVICE_ROLE_KEY` = service_role key (⚠️ Keep this secret! Never commit it to git)
+   ```bash
+   git clone <your-repo-url>
+   cd tv-theme-hipster
+   ```
 
-### 4. Enable Realtime
+2. **Install dependencies**
 
-In your Supabase dashboard:
-1. Go to Database → Replication
-2. Enable replication for the following tables:
+   ```bash
+   npm install
+   ```
+
+3. **Set up Supabase Database**
+
+   Create a new project at [supabase.com](https://supabase.com), then:
+
+   - Open the SQL Editor in your Supabase dashboard
+   - Run `supabase/schema.sql` to create all tables and policies
+   - Run `supabase/seed.sql` to populate with TV shows
+   - If you have an existing database, run `supabase/migration_add_youtube_video_id.sql` first
+
+4. **Configure Environment Variables**
+
+   Create a `.env.local` file in the root directory:
+
+   ```env
+   NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
+   NEXT_PUBLIC_SUPABASE_ANON_KEY=your_anon_key_here
+   SUPABASE_SERVICE_ROLE_KEY=your_service_role_key_here
+   ```
+
+   Find these values in: **Supabase Dashboard → Settings → API**
+
+5. **Enable Realtime**
+
+   In Supabase Dashboard → Database → Replication, enable replication for:
+
    - `lobbies`
    - `players`
    - `game_state`
    - `timelines`
    - `attempts`
 
-### 5. Run the Development Server
+6. **Run the development server**
 
-```bash
-npm run dev
-```
+   ```bash
+   npm run dev
+   ```
 
-Open [http://localhost:3000](http://localhost:3000) in your browser.
+   Open [http://localhost:3000](http://localhost:3000) in your browser.
 
-## How to Play
+## 🎯 How to Play
 
-1. **Create or Join a Game**
-   - Host creates a new game and gets a 6-character join code
-   - Players join using the join code
+### Starting a Game
 
-2. **Lobby**
-   - Host sets target score (5, 10, or custom)
-   - Host starts the game when ready
+1. **Host creates a game**
 
-3. **Gameplay**
-   - Each player starts with 2 random years on their timeline
-   - Each round, a random TV show theme song is played
-   - The DJ (player to the left of the guesser) plays the song
-   - The guesser selects a range placement:
+   - Enter your name on the home page
+   - Click "Create Game"
+   - Share the 6-character join code with friends
+
+2. **Players join**
+
+   - Enter your name
+   - Enter the join code
+   - Wait in the lobby
+
+3. **Host sets up**
+   - Choose target score (5, 10, or custom)
+   - Click "Start Game" when everyone is ready
+
+### Gameplay Flow
+
+**Each Round:**
+
+1. **DJ Plays the Song**
+
+   - One player is the DJ (starts with the host)
+   - DJ sees the show name and plays the YouTube video
+   - DJ clicks "Ready - Start Guessing" when ready
+
+2. **Guesser Makes a Choice**
+
+   - One player is the guesser (rotates each round)
+   - Guesser sees their timeline with years
+   - Select where the show's premiere year fits:
      - **Before X**: Show premiered before or in year X
      - **Between X and Y**: Show premiered between X and Y (inclusive)
      - **After Y**: Show premiered in or after year Y
-   - If correct, the show's premiere year is added to the player's timeline
-   - If wrong, the guess passes to the next player (clockwise)
-   - If the DJ fails, no one scores
-   - First player to reach the target score wins!
 
-## Game Rules
+3. **Result**
 
-- **Tie Rules**: Boundaries count as wins
-  - "Before X" is correct if `show_year <= X`
-  - "Between X and Y" is correct if `X <= show_year <= Y`
-  - "After Y" is correct if `show_year >= Y`
-- **Timeline**: Duplicate years are allowed (multiset)
-- **Score**: Your score equals the number of years in your timeline
+   - ✅ **Correct**: Year is added to your timeline, round ends, you become the next DJ
+   - ❌ **Wrong**: Next player (clockwise) gets to guess
+   - If the DJ is reached without a correct guess, round ends with no points
 
-## Project Structure
+4. **Next Round**
+   - Host clicks "Next Round" to continue
+   - Roles rotate: Previous correct guesser becomes DJ, next player becomes guesser
+
+### Winning
+
+- First player to reach the target score wins!
+- Game ends and shows final scoreboard with everyone's timelines
+
+## 📋 Game Rules
+
+### Tie Rules (Boundaries Count as Wins)
+
+- **"Before X"** is correct if `show_year <= X`
+- **"Between X and Y"** is correct if `X <= show_year <= Y`
+- **"After Y"** is correct if `show_year >= Y`
+
+### Timeline Rules
+
+- Each player starts with 2 random years
+- Duplicate years are allowed (multiset)
+- Your score = number of years in your timeline
+
+### Role Rotation
+
+- Host is always the first DJ
+- Second player is always the first guesser
+- After each correct guess, the guesser becomes the next DJ
+- Roles rotate clockwise around the table
+
+## 🛠️ Tech Stack
+
+- **Next.js 16** (App Router) - React framework
+- **TypeScript** - Type safety
+- **Tailwind CSS** - Styling
+- **Supabase** - Backend (PostgreSQL + Realtime subscriptions)
+- **Server Actions** - Secure server-side mutations
+
+## 📁 Project Structure
 
 ```
 ├── app/
 │   ├── actions/
-│   │   ├── game.ts          # Game logic server actions
-│   │   └── lobby.ts         # Lobby management server actions
-│   ├── game/[code]/         # Game page (main gameplay)
+│   │   ├── game.ts          # Game logic (start, submit guess, advance round)
+│   │   ├── lobby.ts         # Lobby management (create, join, set score)
+│   │   └── shows.ts         # Video resolution from YouTube search URLs
+│   ├── game/[code]/         # Main game page (real-time gameplay)
 │   ├── lobby/[code]/        # Lobby/waiting room
+│   ├── test-videos/         # Test page to preview all videos
 │   ├── layout.tsx           # Root layout
 │   └── page.tsx             # Home page (create/join)
 ├── lib/
@@ -113,27 +181,69 @@ Open [http://localhost:3000](http://localhost:3000) in your browser.
 │   │   └── server.ts        # Server-side Supabase (service role)
 │   ├── types.ts             # TypeScript type definitions
 │   └── utils/
-│       ├── join-code.ts     # Join code generation
+│       ├── join-code.ts     # 6-character join code generation
 │       └── player.ts        # Player ID localStorage utilities
 ├── supabase/
 │   ├── schema.sql           # Database schema + RLS policies
-│   └── seed.sql             # Seed data (TV shows)
+│   ├── seed.sql             # Seed data (24 TV shows)
+│   └── migration_add_youtube_video_id.sql  # Migration for existing DBs
 └── README.md
 ```
 
-## Security Notes
+## 🎬 Video System
 
-- The `SUPABASE_SERVICE_ROLE_KEY` bypasses Row Level Security (RLS)
-- Server actions use the service role key for writes
-- Client-side code only uses the anon key for reads
-- Never expose the service role key in client-side code
+The game uses YouTube search URLs that automatically resolve to the first available video:
 
-## Development
+- Videos are resolved on-demand when a game starts
+- If the first video is unavailable, the system tries the next result
+- Resolved video IDs are cached in the database
+- Test all videos at `/test-videos` page
 
-- The app uses Supabase Realtime for live updates
-- Player IDs are stored in localStorage (no authentication required for MVP)
-- All game state mutations go through server actions for security
+## 🔒 Security
 
-## License
+- **Server Actions**: All mutations go through server actions (never expose service role key)
+- **Row Level Security (RLS)**: Database policies control access
+- **Client vs Server**:
+  - Client uses anon key (read-only with RLS)
+  - Server uses service role key (bypasses RLS for writes)
+- **No Authentication**: MVP uses anonymous player IDs stored in localStorage
+
+## 🧪 Testing
+
+- **Test Videos Page**: Visit `/test-videos` to preview all shows and test video resolution
+- **Local Development**: Run `npm run dev` and open multiple browser windows to test multiplayer
+
+## 📝 Development Notes
+
+- **Realtime Updates**: Uses Supabase Realtime subscriptions for live game state
+- **Polling Fallback**: Includes polling mechanism for critical state transitions
+- **Mobile-First**: Designed for mobile web (PWA-ready)
+- **No External APIs**: All functionality uses Supabase (no paid APIs required)
+
+## 🐛 Troubleshooting
+
+**Videos not loading?**
+
+- Check that Realtime is enabled in Supabase
+- Visit `/test-videos` to resolve videos manually
+- Check browser console for errors
+
+**Game state not updating?**
+
+- Verify Realtime replication is enabled for all game tables
+- Check that environment variables are set correctly
+- Restart the dev server after changing `.env.local`
+
+**Database errors?**
+
+- Make sure you ran `schema.sql` first
+- Then run `seed.sql` to populate shows
+- Check Supabase dashboard for any errors
+
+## 📄 License
 
 MIT
+
+---
+
+**Enjoy playing TV Theme Hipster!** 🎉
