@@ -467,8 +467,8 @@ export default function LobbyPage() {
                   .sort((a, b) => b.score - a.score) // Sort by score descending
                   .map(({ player, score, timeline }) => {
                     const isWinner = player.id === winnerId;
-                    const sortedYears = [...timeline].sort((a, b) => a.year_value - b.year_value);
-                    const uniqueYears = [...new Set(sortedYears.map(t => t.year_value))];
+                    // Sort timeline by year value, but keep ALL entries (including duplicates)
+                    const sortedTimeline = [...timeline].sort((a, b) => a.year_value - b.year_value);
 
                     return (
                       <div
@@ -493,13 +493,13 @@ export default function LobbyPage() {
                         <div className="mt-2">
                           <p className="text-xs font-medium text-gray-600 mb-1">Timeline:</p>
                           <div className="flex flex-wrap gap-1">
-                            {uniqueYears.length > 0 ? (
-                              uniqueYears.map((year) => (
+                            {sortedTimeline.length > 0 ? (
+                              sortedTimeline.map((timelineItem, index) => (
                                 <span
-                                  key={year}
+                                  key={`${timelineItem.id}-${index}`}
                                   className="rounded bg-purple-100 px-2 py-1 text-xs font-medium text-purple-700"
                                 >
-                                  {year}
+                                  {timelineItem.year_value}
                                 </span>
                               ))
                             ) : (

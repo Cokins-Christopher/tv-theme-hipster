@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useMemo } from 'react';
+import { useEffect, useState, useMemo, useRef, useCallback } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase/client';
 import { submitAttempt, markDjReady, advanceRound } from '@/app/actions/game';
@@ -8,10 +8,24 @@ import { getPlayerId } from '@/lib/utils/player';
 import type { GameState, Player, Timeline, Attempt, Show, Lobby } from '@/lib/types';
 import type { GuessType } from '@/lib/types';
 
+// Subscription status types
+type SubscriptionStatus = 'SUBSCRIBED' | 'TIMED_OUT' | 'CLOSED' | 'CHANNEL_ERROR';
+
+// Channel references for cleanup
+interface ChannelRefs {
+  lobby: ReturnType<typeof supabase.channel> | null;
+  gameState: ReturnType<typeof supabase.channel> | null;
+  timelines: ReturnType<typeof supabase.channel> | null;
+  attempts: ReturnType<typeof supabase.channel> | null;
+  players: ReturnType<typeof supabase.channel> | null;
+}
+
 export default function GamePage() {
   const params = useParams();
   const router = useRouter();
   const code = params.code as string;
+  
+  // Core state
   const [lobby, setLobby] = useState<Lobby | null>(null);
   const [gameState, setGameState] = useState<GameState | null>(null);
   const [players, setPlayers] = useState<Player[]>([]);
@@ -20,13 +34,581 @@ export default function GamePage() {
   const [allTimelines, setAllTimelines] = useState<Map<string, Timeline[]>>(new Map());
   const [currentShow, setCurrentShow] = useState<Show | null>(null);
   const [attempts, setAttempts] = useState<Attempt[]>([]);
+  
+  // UI state
   const [selectedBeforeYear, setSelectedBeforeYear] = useState<number | null>(null);
   const [selectedBetweenYears, setSelectedBetweenYears] = useState<[number, number] | null>(null);
   const [selectedAfterYear, setSelectedAfterYear] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  
+  // Connection and subscription state
+  const [connectionStatus, setConnectionStatus] = useState<'connected' | 'disconnected' | 'reconnecting'>('connected');
+  
+  // Refs for cleanup and state management
+  const channelsRef = useRef<ChannelRefs>({
+    lobby: null,
+    gameState: null,
+    timelines: null,
+    attempts: null,
+    players: null,
+  });
+  const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const isMountedRef = useRef(true);
+  const subscriptionsSetupRef = useRef(false);
+  const lastRefreshTimeRef = useRef(0);
+  const refreshDebounceRef = useRef<NodeJS.Timeout | null>(null);
+  const gameStateRef = useRef<GameState | null>(null);
+  
+  // Constants
+  const POLLING_INTERVAL = 5000; // 5 seconds fallback polling
+  const REFRESH_DEBOUNCE_MS = 200; // Debounce refreshes to prevent excessive calls (reduced for faster updates)
+  const MIN_REFRESH_INTERVAL = 300; // Minimum time between manual refreshes (reduced for faster updates)
+  const ACTION_UPDATE_DELAY = 100; // Small delay after action to allow DB to update
+
+  // ============================================================================
+  // STABLE DATA FETCHING FUNCTIONS (no dependencies to prevent loops)
+  // ============================================================================
+
+  const fetchShow = useCallback(async (showId: string): Promise<Show | null> => {
+    if (!isMountedRef.current) return null;
+    
+    try {
+      const { data: showData, error: showError } = await supabase
+        .from('shows')
+        .select('*')
+        .eq('id', showId)
+        .single();
+
+      if (showError) {
+        console.error('[Game] Error fetching show:', showError);
+        return null;
+      }
+
+      return showData || null;
+    } catch (err) {
+      console.error('[Game] Exception fetching show:', err);
+      return null;
+    }
+  }, []);
+
+  const fetchPlayers = useCallback(async (lobbyId: string): Promise<Player[] | null> => {
+    if (!isMountedRef.current) return null;
+    
+    try {
+      const { data: playersData, error: playersError } = await supabase
+        .from('players')
+        .select('*')
+        .eq('lobby_id', lobbyId)
+        .order('seat', { ascending: true });
+
+      if (playersError) {
+        console.error('[Game] Error fetching players:', playersError);
+        return null;
+      }
+
+      return playersData || null;
+    } catch (err) {
+      console.error('[Game] Exception fetching players:', err);
+      return null;
+    }
+  }, []);
+
+  const fetchTimelines = useCallback(async (lobbyId: string): Promise<Map<string, Timeline[]> | null> => {
+    if (!isMountedRef.current) return null;
+    
+    try {
+      const { data: timelinesData, error: timelinesError } = await supabase
+        .from('timelines')
+        .select('*')
+        .eq('lobby_id', lobbyId)
+        .order('year_value', { ascending: true });
+
+      if (timelinesError) {
+        console.error('[Game] Error fetching timelines:', timelinesError);
+        return null;
+      }
+
+      if (timelinesData) {
+        const timelineMap = new Map<string, Timeline[]>();
+        for (const timeline of timelinesData) {
+          const existing = timelineMap.get(timeline.player_id) || [];
+          timelineMap.set(timeline.player_id, [...existing, timeline]);
+        }
+        return timelineMap;
+      }
+      
+      return null;
+    } catch (err) {
+      console.error('[Game] Exception fetching timelines:', err);
+      return null;
+    }
+  }, []);
+
+  const fetchAttempts = useCallback(async (lobbyId: string, roundNumber: number): Promise<Attempt[] | null> => {
+    if (!isMountedRef.current) return null;
+    
+    try {
+      const { data: attemptsData, error: attemptsError } = await supabase
+        .from('attempts')
+        .select('*')
+        .eq('lobby_id', lobbyId)
+        .eq('round_number', roundNumber)
+        .order('attempt_order', { ascending: true });
+
+      if (attemptsError) {
+        console.error('[Game] Error fetching attempts:', attemptsError);
+        return null;
+      }
+
+      return attemptsData || null;
+    } catch (err) {
+      console.error('[Game] Exception fetching attempts:', err);
+      return null;
+    }
+  }, []);
+
+  const fetchGameState = useCallback(async (lobbyId: string): Promise<GameState | null> => {
+    if (!isMountedRef.current) return null;
+    
+    try {
+      const { data: gameStateData, error: gameStateError } = await supabase
+        .from('game_state')
+        .select('*')
+        .eq('lobby_id', lobbyId)
+        .single();
+
+      if (gameStateError) {
+        console.error('[Game] Error fetching game state:', gameStateError);
+        return null;
+      }
+
+      return gameStateData || null;
+    } catch (err) {
+      console.error('[Game] Exception fetching game state:', err);
+      return null;
+    }
+  }, []);
+
+  const fetchLobby = useCallback(async (): Promise<Lobby | null> => {
+    if (!isMountedRef.current) return null;
+    
+    try {
+      const { data: lobbyData, error: lobbyError } = await supabase
+        .from('lobbies')
+        .select('*')
+        .eq('join_code', code.toUpperCase())
+        .single();
+
+      if (lobbyError) {
+        console.error('[Game] Error fetching lobby:', lobbyError);
+        return null;
+      }
+
+      return lobbyData || null;
+    } catch (err) {
+      console.error('[Game] Exception fetching lobby:', err);
+      return null;
+    }
+  }, [code]);
+
+  // ============================================================================
+  // DEBOUNCED REFRESH FUNCTION
+  // ============================================================================
+
+  const refreshAllData = useCallback(async (
+    lobbyId: string, 
+    currentPlayerId: string | null, 
+    roundNumber?: number,
+    force = false
+  ) => {
+    if (!isMountedRef.current) return;
+    
+    const now = Date.now();
+    
+    // Debounce: don't refresh if we just refreshed recently (unless forced)
+    if (!force && now - lastRefreshTimeRef.current < MIN_REFRESH_INTERVAL) {
+      return;
+    }
+    
+    lastRefreshTimeRef.current = now;
+    
+    // Clear any pending debounced refresh
+    if (refreshDebounceRef.current) {
+      clearTimeout(refreshDebounceRef.current);
+      refreshDebounceRef.current = null;
+    }
+    
+    // Debounce the actual refresh
+    refreshDebounceRef.current = setTimeout(async () => {
+      if (!isMountedRef.current) return;
+      
+      try {
+        // Fetch all data in parallel
+        const [lobbyData, gameStateData, playersData, timelinesMap, attemptsData] = await Promise.all([
+          fetchLobby(),
+          fetchGameState(lobbyId),
+          fetchPlayers(lobbyId),
+          fetchTimelines(lobbyId),
+          roundNumber !== undefined ? fetchAttempts(lobbyId, roundNumber) : Promise.resolve(null),
+        ]);
+
+        if (!isMountedRef.current) return;
+
+        // Update state only if we have data
+        if (lobbyData) {
+          setLobby(lobbyData);
+          
+          if (lobbyData.status === 'finished') {
+            router.push(`/lobby/${code}`);
+            return;
+          }
+          
+          if (lobbyData.status === 'waiting') {
+            router.push(`/lobby/${code}`);
+            return;
+          }
+        }
+
+        if (gameStateData) {
+          gameStateRef.current = gameStateData;
+          setGameState(gameStateData);
+          
+          // Fetch show if changed
+          if (gameStateData.show_id) {
+            const showData = await fetchShow(gameStateData.show_id);
+            if (showData && isMountedRef.current) {
+              setCurrentShow(showData);
+            }
+          }
+        }
+
+        if (playersData) {
+          setPlayers(playersData);
+        }
+
+        if (timelinesMap) {
+          setAllTimelines(timelinesMap);
+          if (currentPlayerId) {
+            const myTimelineData = timelinesMap.get(currentPlayerId) || [];
+            setMyTimeline(myTimelineData);
+          }
+        }
+
+        if (attemptsData && roundNumber !== undefined) {
+          setAttempts(attemptsData);
+        }
+      } catch (err) {
+        console.error('[Game] Error refreshing all data:', err);
+      }
+    }, REFRESH_DEBOUNCE_MS);
+  }, [code, router, fetchLobby, fetchGameState, fetchPlayers, fetchTimelines, fetchAttempts, fetchShow]);
+
+  // ============================================================================
+  // SUBSCRIPTION MANAGEMENT (setup once, stable)
+  // ============================================================================
+
+  const setupLobbySubscription = useCallback((lobbyId: string) => {
+    if (channelsRef.current.lobby) {
+      supabase.removeChannel(channelsRef.current.lobby);
+    }
+
+    const channel = supabase
+      .channel(`lobby-${lobbyId}-${Date.now()}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'lobbies',
+          filter: `id=eq.${lobbyId}`,
+        },
+        async (payload) => {
+          if (payload.eventType === 'UPDATE' && payload.new && isMountedRef.current) {
+            const updatedLobby = payload.new as Lobby;
+            setLobby(updatedLobby);
+            
+            if (updatedLobby.status === 'finished') {
+              router.push(`/lobby/${code}`);
+              return;
+            }
+            
+            if (updatedLobby.status === 'waiting') {
+              router.push(`/lobby/${code}`);
+              return;
+            }
+          }
+        }
+      )
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+          setConnectionStatus('connected');
+        } else if (status === 'TIMED_OUT' || status === 'CHANNEL_ERROR') {
+          setConnectionStatus('disconnected');
+        }
+      });
+
+    channelsRef.current.lobby = channel;
+  }, [code, router]);
+
+  const setupGameStateSubscription = useCallback((lobbyId: string) => {
+    if (channelsRef.current.gameState) {
+      supabase.removeChannel(channelsRef.current.gameState);
+    }
+
+    const channel = supabase
+      .channel(`game-state-${lobbyId}-${Date.now()}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'game_state',
+          filter: `lobby_id=eq.${lobbyId}`,
+        },
+        async (payload) => {
+          console.log('[Game] Game state subscription triggered:', payload.eventType);
+          if ((payload.eventType === 'UPDATE' || payload.eventType === 'INSERT') && payload.new && isMountedRef.current) {
+            const newState = payload.new as GameState;
+            console.log('[Game] Updating game state from subscription:', {
+              round_state: newState.round_state,
+              round_number: newState.current_round_number,
+              attempt_seat: newState.current_attempt_seat
+            });
+            
+            // CRITICAL: Update game state immediately
+            const prevState = gameStateRef.current;
+            gameStateRef.current = newState;
+            setGameState(newState);
+            
+            console.log('[Game] State updated in subscription - round_state:', newState.round_state, 'prev:', prevState?.round_state);
+            
+            // Reset guess UI when round changes
+            if (prevState && newState.current_round_number !== prevState.current_round_number) {
+              setSelectedBeforeYear(null);
+              setSelectedBetweenYears(null);
+              setSelectedAfterYear(null);
+            }
+
+            // Fetch show if changed
+            if (newState.show_id) {
+              const showData = await fetchShow(newState.show_id);
+              if (showData && isMountedRef.current) {
+                setCurrentShow(showData);
+              }
+            }
+
+            // Refresh timelines
+            const timelinesMap = await fetchTimelines(lobbyId);
+            if (timelinesMap && isMountedRef.current) {
+              setAllTimelines(timelinesMap);
+              const currentPlayerId = playerId || null;
+              if (currentPlayerId) {
+                const myTimelineData = timelinesMap.get(currentPlayerId) || [];
+                setMyTimeline(myTimelineData);
+              }
+            }
+
+            // Fetch attempts for current round - CRITICAL: Always fetch attempts
+            const attemptsData = await fetchAttempts(lobbyId, newState.current_round_number);
+            if (attemptsData && isMountedRef.current) {
+              console.log('[Game] Updated attempts from subscription:', attemptsData.length);
+              setAttempts(attemptsData);
+            }
+
+            // Check lobby status
+            const currentLobby = await fetchLobby();
+            if (currentLobby && isMountedRef.current) {
+              if (currentLobby.status === 'finished') {
+                router.push(`/lobby/${code}`);
+                return;
+              }
+            }
+          }
+        }
+      )
+      .subscribe((status) => {
+        if (status === 'TIMED_OUT' || status === 'CHANNEL_ERROR') {
+          setConnectionStatus('disconnected');
+        }
+      });
+
+    channelsRef.current.gameState = channel;
+  }, [playerId, code, router, fetchShow, fetchTimelines, fetchAttempts, fetchLobby]);
+
+  const setupTimelinesSubscription = useCallback((lobbyId: string) => {
+    if (channelsRef.current.timelines) {
+      supabase.removeChannel(channelsRef.current.timelines);
+    }
+
+    const channel = supabase
+      .channel(`timelines-${lobbyId}-${Date.now()}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'timelines',
+          filter: `lobby_id=eq.${lobbyId}`,
+        },
+        async () => {
+          console.log('[Game] Timeline subscription triggered');
+          const timelinesMap = await fetchTimelines(lobbyId);
+          if (timelinesMap && isMountedRef.current) {
+            setAllTimelines(timelinesMap);
+            const currentPlayerId = playerId || null;
+            if (currentPlayerId) {
+              const myTimelineData = timelinesMap.get(currentPlayerId) || [];
+              setMyTimeline(myTimelineData);
+            }
+          }
+        }
+      )
+      .subscribe();
+
+    channelsRef.current.timelines = channel;
+  }, [playerId, fetchTimelines]);
+
+  const setupAttemptsSubscription = useCallback((lobbyId: string, roundNumber: number) => {
+    if (channelsRef.current.attempts) {
+      supabase.removeChannel(channelsRef.current.attempts);
+    }
+
+    const channel = supabase
+      .channel(`attempts-${lobbyId}-${Date.now()}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'attempts',
+          filter: `lobby_id=eq.${lobbyId}`,
+        },
+        async () => {
+          console.log('[Game] Attempts subscription triggered - fetching latest attempts and game state');
+          // CRITICAL: Always fetch attempts AND game state when attempts change
+          // This ensures we see if round_state changed to 'revealed' when guess is correct
+          const [currentGameState, attemptsData, timelinesMap] = await Promise.all([
+            fetchGameState(lobbyId),
+            fetchAttempts(lobbyId, gameStateRef.current?.current_round_number || roundNumber),
+            fetchTimelines(lobbyId)
+          ]);
+          
+          if (currentGameState && isMountedRef.current) {
+            // Update game state if it changed (e.g., round_state to 'revealed')
+            const prevState = gameStateRef.current;
+            if (currentGameState.round_state !== prevState?.round_state ||
+                currentGameState.current_attempt_seat !== prevState?.current_attempt_seat) {
+              console.log('[Game] Game state changed in attempts subscription:', {
+                round_state: { from: prevState?.round_state, to: currentGameState.round_state },
+                attempt_seat: { from: prevState?.current_attempt_seat, to: currentGameState.current_attempt_seat }
+              });
+              gameStateRef.current = currentGameState;
+              setGameState(currentGameState);
+            }
+          }
+          
+          if (attemptsData && isMountedRef.current) {
+            console.log('[Game] Updated attempts from attempts subscription:', attemptsData.length);
+            setAttempts(attemptsData);
+          }
+          
+          if (timelinesMap && isMountedRef.current) {
+            setAllTimelines(timelinesMap);
+            if (playerId) {
+              const myTimelineData = timelinesMap.get(playerId) || [];
+              setMyTimeline(myTimelineData);
+            }
+          }
+        }
+      )
+      .subscribe();
+
+    channelsRef.current.attempts = channel;
+  }, [playerId, fetchGameState, fetchAttempts, fetchTimelines]);
+
+  const setupPlayersSubscription = useCallback((lobbyId: string) => {
+    if (channelsRef.current.players) {
+      supabase.removeChannel(channelsRef.current.players);
+    }
+
+    const channel = supabase
+      .channel(`players-${lobbyId}-${Date.now()}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'players',
+          filter: `lobby_id=eq.${lobbyId}`,
+        },
+        async () => {
+          const playersData = await fetchPlayers(lobbyId);
+          if (playersData && isMountedRef.current) {
+            setPlayers(playersData);
+          }
+        }
+      )
+      .subscribe();
+
+    channelsRef.current.players = channel;
+  }, [fetchPlayers]);
+
+  const setupAllSubscriptions = useCallback((lobbyId: string, roundNumber?: number) => {
+    if (!isMountedRef.current || subscriptionsSetupRef.current) return;
+    
+    subscriptionsSetupRef.current = true;
+    
+    setupLobbySubscription(lobbyId);
+    setupGameStateSubscription(lobbyId);
+    setupTimelinesSubscription(lobbyId);
+    setupPlayersSubscription(lobbyId);
+    
+    if (roundNumber !== undefined) {
+      setupAttemptsSubscription(lobbyId, roundNumber);
+    }
+    
+    // Stop polling if subscriptions are active
+    if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current);
+      pollingIntervalRef.current = null;
+    }
+    
+    setConnectionStatus('connected');
+  }, [setupLobbySubscription, setupGameStateSubscription, setupTimelinesSubscription, setupPlayersSubscription, setupAttemptsSubscription]);
+
+  // ============================================================================
+  // FALLBACK POLLING (only when subscriptions fail)
+  // ============================================================================
+
+  const startPollingFallback = useCallback(() => {
+    if (pollingIntervalRef.current) return;
+    
+    setConnectionStatus('reconnecting');
+    
+    pollingIntervalRef.current = setInterval(() => {
+      if (!isMountedRef.current || !lobby?.id || !playerId) return;
+      
+      refreshAllData(lobby.id, playerId, gameState?.current_round_number, false);
+    }, POLLING_INTERVAL);
+  }, [lobby?.id, playerId, gameState?.current_round_number, refreshAllData]);
+
+  const stopPollingFallback = useCallback(() => {
+    if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current);
+      pollingIntervalRef.current = null;
+    }
+  }, []);
+
+  // ============================================================================
+  // INITIALIZATION (setup once)
+  // ============================================================================
 
   useEffect(() => {
+    isMountedRef.current = true;
+    subscriptionsSetupRef.current = false;
+    
     const id = getPlayerId();
     if (!id) {
       router.push('/');
@@ -34,447 +616,273 @@ export default function GamePage() {
     }
     setPlayerId(id);
 
-    const fetchData = async () => {
-      // Fetch lobby
-      const { data: lobbyData } = await supabase
-        .from('lobbies')
-        .select('*')
-        .eq('join_code', code.toUpperCase())
-        .single();
+    const initializeGame = async () => {
+      try {
+        const lobbyData = await fetchLobby();
+        if (!lobbyData || !isMountedRef.current) return;
 
-      if (!lobbyData) {
-        return;
+        setLobby(lobbyData);
+        
+        if (lobbyData.status === 'waiting') {
+          router.push(`/lobby/${code}`);
+          return;
+        }
+
+        // Fetch initial data
+        const [gameStateData, playersData, timelinesMap] = await Promise.all([
+          fetchGameState(lobbyData.id),
+          fetchPlayers(lobbyData.id),
+          fetchTimelines(lobbyData.id),
+        ]);
+
+        if (!isMountedRef.current) return;
+
+        if (gameStateData) {
+          gameStateRef.current = gameStateData;
+          setGameState(gameStateData);
+          
+          // Fetch show and attempts
+          if (gameStateData.show_id) {
+            const showData = await fetchShow(gameStateData.show_id);
+            if (showData && isMountedRef.current) {
+              setCurrentShow(showData);
+            }
+          }
+          
+          const attemptsData = await fetchAttempts(lobbyData.id, gameStateData.current_round_number);
+          if (attemptsData && isMountedRef.current) {
+            setAttempts(attemptsData);
+          }
+        }
+
+        if (playersData) {
+          setPlayers(playersData);
+        }
+
+        if (timelinesMap) {
+          setAllTimelines(timelinesMap);
+          const myTimelineData = timelinesMap.get(id) || [];
+          setMyTimeline(myTimelineData);
+        }
+
+        // Set up subscriptions ONCE
+        if (isMountedRef.current && lobbyData.id && gameStateData) {
+          setupAllSubscriptions(lobbyData.id, gameStateData.current_round_number);
+        }
+      } catch (err) {
+        console.error('[Game] Error initializing game:', err);
+        setError('Failed to load game. Please try refreshing the page.');
       }
+    };
 
-      setLobby(lobbyData);
-      if (lobbyData.status === 'waiting') {
+    initializeGame();
+
+    return () => {
+      isMountedRef.current = false;
+      subscriptionsSetupRef.current = false;
+      
+      // Clean up all subscriptions
+      Object.values(channelsRef.current).forEach(channel => {
+        if (channel) {
+          supabase.removeChannel(channel);
+        }
+      });
+      
+      // Clear polling
+      stopPollingFallback();
+      
+      // Clear debounce timeout
+      if (refreshDebounceRef.current) {
+        clearTimeout(refreshDebounceRef.current);
+      }
+      
+      // Reset channel refs
+      channelsRef.current = {
+        lobby: null,
+        gameState: null,
+        timelines: null,
+        attempts: null,
+        players: null,
+      };
+    };
+  }, [code, router, fetchLobby, fetchGameState, fetchPlayers, fetchTimelines, fetchShow, fetchAttempts, setupAllSubscriptions, stopPollingFallback]);
+
+  // Update attempts subscription when round changes
+  useEffect(() => {
+    if (lobby?.id && gameState?.current_round_number !== undefined && subscriptionsSetupRef.current) {
+      setupAttemptsSubscription(lobby.id, gameState.current_round_number);
+      
+      // Also fetch attempts immediately
+      fetchAttempts(lobby.id, gameState.current_round_number).then(attemptsData => {
+        if (attemptsData && isMountedRef.current) {
+          setAttempts(attemptsData);
+        }
+      });
+    }
+  }, [lobby?.id, gameState?.current_round_number, setupAttemptsSubscription, fetchAttempts]);
+
+  // Reset submission state when it's no longer this player's turn
+  useEffect(() => {
+    if (gameState && playerId) {
+      const currentPlayer = players.find(p => p.id === playerId);
+      const isMyTurn = currentPlayer && 
+        currentPlayer.seat !== null && 
+        gameState.current_attempt_seat === currentPlayer.seat &&
+        gameState.round_state === 'guessing';
+      
+      if (!isMyTurn && isSubmitting) {
+        setIsSubmitting(false);
+        setLoading(false);
+      }
+    }
+  }, [gameState?.current_attempt_seat, gameState?.round_state, playerId, players, isSubmitting]);
+
+  // Fetch show when gameState.show_id changes
+  useEffect(() => {
+    const loadShow = async () => {
+      if (!gameState?.show_id || !isMountedRef.current) return;
+      
+      if (currentShow && currentShow.id === gameState.show_id) return;
+      
+      const showData = await fetchShow(gameState.show_id);
+      if (showData && isMountedRef.current) {
+        setCurrentShow(showData);
+      }
+    };
+
+    loadShow();
+  }, [gameState?.show_id, currentShow?.id, fetchShow]);
+
+  // Poll for game state changes - ALL players poll to see updates immediately
+  useEffect(() => {
+    if (!lobby?.id || !gameState || !isMountedRef.current) return;
+    
+    const currentPlayer = players.find(p => p.id === playerId);
+    if (!currentPlayer || currentPlayer.seat === null) return;
+    
+    // Calculate isHost inline to avoid dependency issues
+    const isHostPlayer = lobby && playerId && lobby.host_player_id === playerId;
+    
+    // CRITICAL: Always poll when game is active to catch all state changes
+    // This ensures all players see updates immediately when:
+    // - Someone submits a guess (attempts change, round_state might change)
+    // - Round is revealed (round_state changes to 'revealed')
+    // - Next guesser's turn (attempt_seat changes)
+    // - New round starts (round_number changes)
+    
+    console.log('[Game] Setting up continuous polling for all state changes');
+    
+    const pollInterval = setInterval(async () => {
+      if (!isMountedRef.current || !lobby?.id) return;
+      
+      // CRITICAL: Also check lobby status to detect game finish
+      const [currentLobby, currentGameState, currentAttemptsData] = await Promise.all([
+        fetchLobby(),
+        fetchGameState(lobby.id),
+        fetchAttempts(lobby.id, gameStateRef.current?.current_round_number || gameState.current_round_number)
+      ]);
+      
+      // Check if lobby status changed to 'finished'
+      if (currentLobby && currentLobby.status === 'finished' && lobby.status !== 'finished') {
+        console.log('[Game] Poll detected game finished - redirecting to lobby');
+        setLobby(currentLobby);
         router.push(`/lobby/${code}`);
         return;
       }
-
-      // Fetch game state
-      let gameStateData: GameState | null = null;
-      const { data: gameStateResult } = await supabase
-        .from('game_state')
-        .select('*')
-        .eq('lobby_id', lobbyData.id)
-        .single();
-
-      if (gameStateResult) {
-        gameStateData = gameStateResult;
-        setGameState(gameStateData);
-
-        // Fetch current show - CRITICAL: Must fetch immediately when game starts
-        if (gameStateData.show_id) {
-          console.log('[Game] Fetching show with ID:', gameStateData.show_id);
-          const { data: showData, error: showError } = await supabase
-            .from('shows')
-            .select('*')
-            .eq('id', gameStateData.show_id)
-            .single();
-
-          if (showError) {
-            console.error('[Game] Error fetching show:', showError);
-            // Retry once
-            const { data: retryShowData } = await supabase
-              .from('shows')
-              .select('*')
-              .eq('id', gameStateData.show_id)
-              .single();
-            if (retryShowData) {
-              console.log('[Game] Show loaded on retry:', retryShowData.show_name);
-              setCurrentShow(retryShowData);
-            }
-          } else if (showData) {
-            console.log('[Game] Show loaded:', showData.show_name);
-            setCurrentShow(showData);
-          } else {
-            console.warn('[Game] No show data found for ID:', gameStateData.show_id);
-          }
-        } else {
-          console.warn('[Game] No show_id in game state - game may not be started yet');
-        }
-      }
-
-      // Fetch players
-      const { data: playersData, error: playersError } = await supabase
-        .from('players')
-        .select('*')
-        .eq('lobby_id', lobbyData.id)
-        .order('seat', { ascending: true });
-
-      if (playersError) {
-        console.error('[Game] Error fetching players:', playersError);
-      }
-
-      if (playersData) {
-        console.log('[Game] Players fetched:', playersData.map(p => ({ id: p.id, name: p.name, seat: p.seat })));
-        setPlayers(playersData);
+      
+      if (currentGameState && isMountedRef.current) {
+        const prevState = gameStateRef.current;
         
-        // Verify current player is in the list
-        const currentPlayer = playersData.find(p => p.id === id);
-        if (!currentPlayer) {
-          console.error('[Game] Current player not found in players list!', { playerId: id, players: playersData });
-        } else {
-          console.log('[Game] Current player found:', { id: currentPlayer.id, name: currentPlayer.name, seat: currentPlayer.seat });
+        // Check if state changed
+        const roundStateChanged = currentGameState.round_state !== prevState?.round_state;
+        const attemptSeatChanged = currentGameState.current_attempt_seat !== prevState?.current_attempt_seat;
+        const roundNumberChanged = currentGameState.current_round_number !== prevState?.current_round_number;
+        const showIdChanged = currentGameState.show_id !== prevState?.show_id;
+        
+        // Check if attempts changed (new attempt added)
+        const attemptsChanged = currentAttemptsData && 
+          currentAttemptsData.length !== attempts.length;
+        
+        if (roundStateChanged || attemptSeatChanged || roundNumberChanged || showIdChanged || attemptsChanged) {
+          console.log('[Game] Poll detected state change:', {
+            round_state: { from: prevState?.round_state, to: currentGameState.round_state },
+            attempt_seat: { from: prevState?.current_attempt_seat, to: currentGameState.current_attempt_seat },
+            round_number: { from: prevState?.current_round_number, to: currentGameState.current_round_number },
+            attempts_count: { from: attempts.length, to: currentAttemptsData?.length || 0 }
+          });
+          
+          gameStateRef.current = currentGameState;
+          setGameState(currentGameState);
+          
+          // Always refresh attempts when they change
+          if (currentAttemptsData && isMountedRef.current) {
+            setAttempts(currentAttemptsData);
+          }
+          
+          // Refresh timelines
+          const timelinesMap = await fetchTimelines(lobby.id);
+          if (timelinesMap && isMountedRef.current) {
+            setAllTimelines(timelinesMap);
+            if (playerId) {
+              const myTimelineData = timelinesMap.get(playerId) || [];
+              setMyTimeline(myTimelineData);
+            }
+          }
+          
+          // Fetch show if round number changed or show_id changed
+          if ((roundNumberChanged || showIdChanged) && currentGameState.show_id) {
+            const showData = await fetchShow(currentGameState.show_id);
+            if (showData && isMountedRef.current) {
+              setCurrentShow(showData);
+            }
+          }
+          
+          // Clear attempts if round changed
+          if (roundNumberChanged) {
+            setAttempts([]);
+          }
         }
       }
-
-      // Fetch timelines
-      const { data: timelinesData } = await supabase
-        .from('timelines')
-        .select('*')
-        .eq('lobby_id', lobbyData.id)
-        .order('year_value', { ascending: true });
-
-      if (timelinesData) {
-        const timelineMap = new Map<string, Timeline[]>();
-        for (const timeline of timelinesData) {
-          const existing = timelineMap.get(timeline.player_id) || [];
-          timelineMap.set(timeline.player_id, [...existing, timeline]);
-        }
-        setAllTimelines(timelineMap);
-        if (id) {
-          setMyTimeline(timelineMap.get(id) || []);
-        }
-      }
-
-      // Fetch attempts for current round
-      if (gameStateData) {
-        const { data: attemptsData } = await supabase
-          .from('attempts')
-          .select('*')
-          .eq('lobby_id', lobbyData.id)
-          .eq('round_number', gameStateData.current_round_number)
-          .order('attempt_order', { ascending: true });
-
-        if (attemptsData) {
-          setAttempts(attemptsData);
-        }
-      }
-    };
-
-    fetchData();
-
-    // Set up subscriptions after lobby is loaded
-    let gameChannel: ReturnType<typeof supabase.channel> | null = null;
+    }, 300); // Poll every 300ms - frequent enough for real-time feel, not too aggressive
     
-    const setupGameStateSubscription = (lobbyIdToUse: string) => {
-      if (gameChannel) {
-        supabase.removeChannel(gameChannel);
-      }
-
-      gameChannel = supabase
-        .channel(`game-state-${lobbyIdToUse}-${Date.now()}`)
-        .on(
-          'postgres_changes',
-          {
-            event: '*',
-            schema: 'public',
-            table: 'game_state',
-            filter: `lobby_id=eq.${lobbyIdToUse}`,
-          },
-          async (payload) => {
-            console.log('[Game] Game state update:', payload.eventType, payload.new);
-            if (payload.eventType === 'UPDATE' || payload.eventType === 'INSERT') {
-              const newState = payload.new as GameState;
-              console.log('[Game] New game state round_state:', newState.round_state);
-              setGameState(newState);
-              
-              // Check if lobby is finished and redirect (refetch to get latest status)
-              const { data: currentLobby } = await supabase
-                .from('lobbies')
-                .select('status')
-                .eq('id', lobbyIdToUse)
-                .single();
-              
-              if (currentLobby?.status === 'finished') {
-                console.log('[Game] Lobby finished, redirecting to lobby...');
-                setLobby({ ...lobby, status: 'finished' } as Lobby);
-                router.push(`/lobby/${code}`);
-                return;
-              }
-
-              // Fetch new show if changed or if we don't have one yet
-              if (newState.show_id) {
-                console.log('[Game] Fetching show from realtime update:', newState.show_id);
-                const { data: showData, error: showError } = await supabase
-                  .from('shows')
-                  .select('*')
-                  .eq('id', newState.show_id)
-                  .single();
-
-                if (showError) {
-                  console.error('[Game] Error fetching show from realtime:', showError);
-                }
-
-                if (showData) {
-                  console.log('[Game] Show updated from realtime:', showData.show_name);
-                  setCurrentShow(showData);
-                }
-              }
-
-              // IMPORTANT: Fetch timelines when game state changes
-              // This ensures timelines are loaded when game starts or state changes
-              console.log('[Game] Refreshing timelines after game state update...');
-              const { data: timelinesData } = await supabase
-                .from('timelines')
-                .select('*')
-                .eq('lobby_id', lobbyIdToUse)
-                .order('year_value', { ascending: true });
-
-              if (timelinesData) {
-                const timelineMap = new Map<string, Timeline[]>();
-                for (const timeline of timelinesData) {
-                  const existing = timelineMap.get(timeline.player_id) || [];
-                  timelineMap.set(timeline.player_id, [...existing, timeline]);
-                }
-                setAllTimelines(timelineMap);
-                if (id) {
-                  const myTimelineData = timelineMap.get(id) || [];
-                  setMyTimeline(myTimelineData);
-                  console.log('[Game] Timelines refreshed after game state update:', myTimelineData.length, 'years for me');
-                }
-              }
-
-              // Reset guess UI when round changes
-              if (newState.current_round_number !== gameState?.current_round_number) {
-                setSelectedBeforeYear(null);
-                setSelectedBetweenYears(null);
-                setSelectedAfterYear(null);
-              }
-
-              // Fetch attempts for new round
-              const { data: attemptsData } = await supabase
-                .from('attempts')
-                .select('*')
-                .eq('lobby_id', newState.lobby_id)
-                .eq('round_number', newState.current_round_number)
-                .order('attempt_order', { ascending: true });
-
-              if (attemptsData) {
-                setAttempts(attemptsData);
-              }
-            }
-          }
-        )
-        .subscribe((status) => {
-          console.log('[Game] Game state subscription status:', status);
-        });
-    };
-
-    // Subscribe to lobby changes
-    const lobbyChannel = supabase
-      .channel(`game-lobby-${code}-${Date.now()}`)
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'lobbies',
-          filter: `join_code=eq.${code.toUpperCase()}`,
-        },
-          (payload) => {
-            console.log('[Game] Lobby update:', payload.eventType);
-            if (payload.eventType === 'UPDATE') {
-              const updatedLobby = payload.new as Lobby;
-              setLobby(updatedLobby);
-              
-              // Set up game state subscription when we have lobby ID
-              if (updatedLobby.id) {
-                setupGameStateSubscription(updatedLobby.id);
-              }
-              
-              if (updatedLobby.status === 'finished') {
-                // Game over - redirect all players back to lobby
-                console.log('[Game] Game finished, redirecting to lobby...');
-                router.push(`/lobby/${code}`);
-              }
-            }
-          }
-      )
-      .subscribe((status) => {
-        console.log('[Game] Lobby subscription status:', status);
-      });
-
-    // Set up timelines and attempts subscriptions
-    let timelinesChannel: ReturnType<typeof supabase.channel> | null = null;
-    let attemptsChannel: ReturnType<typeof supabase.channel> | null = null;
-
-    const setupAllSubscriptions = (lobbyIdToUse: string) => {
-      setupGameStateSubscription(lobbyIdToUse);
-      
-      if (timelinesChannel) supabase.removeChannel(timelinesChannel);
-      timelinesChannel = supabase
-        .channel(`timelines-${lobbyIdToUse}-${Date.now()}`)
-        .on(
-          'postgres_changes',
-          {
-            event: '*',
-            schema: 'public',
-            table: 'timelines',
-            filter: `lobby_id=eq.${lobbyIdToUse}`,
-          },
-          async () => {
-            console.log('[Game] Timeline change detected, refreshing...');
-            const { data: timelinesData } = await supabase
-              .from('timelines')
-              .select('*')
-              .eq('lobby_id', lobbyIdToUse)
-              .order('year_value', { ascending: true });
-
-            if (timelinesData) {
-              const timelineMap = new Map<string, Timeline[]>();
-              for (const timeline of timelinesData) {
-                const existing = timelineMap.get(timeline.player_id) || [];
-                timelineMap.set(timeline.player_id, [...existing, timeline]);
-              }
-              setAllTimelines(timelineMap);
-              if (id) {
-                const myTimelineData = timelineMap.get(id) || [];
-                setMyTimeline(myTimelineData);
-                console.log('[Game] My timeline updated:', myTimelineData.length, 'years');
-              }
-            }
-          }
-        )
-        .subscribe((status) => {
-          console.log('[Game] Timelines subscription status:', status);
-        });
-
-      if (attemptsChannel) supabase.removeChannel(attemptsChannel);
-      attemptsChannel = supabase
-        .channel(`attempts-${lobbyIdToUse}-${Date.now()}`)
-        .on(
-          'postgres_changes',
-          {
-            event: '*',
-            schema: 'public',
-            table: 'attempts',
-            filter: `lobby_id=eq.${lobbyIdToUse}`,
-          },
-          async () => {
-            if (gameState) {
-              const { data: attemptsData } = await supabase
-                .from('attempts')
-                .select('*')
-                .eq('lobby_id', lobbyIdToUse)
-                .eq('round_number', gameState.current_round_number)
-                .order('attempt_order', { ascending: true });
-
-              if (attemptsData) {
-                setAttempts(attemptsData);
-              }
-            }
-          }
-        )
-        .subscribe();
-    };
-
-    // Set up subscriptions after initial fetch
-    fetchData().then(() => {
-      if (lobby?.id) {
-        setupAllSubscriptions(lobby.id);
-      }
-    });
-
-    // Also set up when lobby updates
-    const originalLobbyHandler = lobbyChannel._callbacks?.postgres_changes?.[0];
-    if (originalLobbyHandler) {
-      // The handler already sets up game state subscription
-    }
-
     return () => {
-      if (lobbyChannel) supabase.removeChannel(lobbyChannel);
-      if (gameChannel) supabase.removeChannel(gameChannel);
-      if (timelinesChannel) supabase.removeChannel(timelinesChannel);
-      if (attemptsChannel) supabase.removeChannel(attemptsChannel);
+      clearInterval(pollInterval);
     };
-  }, [code, router, lobby?.id, gameState?.current_round_number, gameState?.show_id, playerId]);
+  }, [
+    lobby?.id,
+    lobby?.status, // Include lobby status to detect game finish
+    gameState?.round_state, 
+    gameState?.current_round_number,
+    attempts.length, // Include attempts length to detect new attempts
+    playerId, 
+    players, 
+    code,
+    router,
+    fetchLobby,
+    fetchGameState, 
+    fetchAttempts, 
+    fetchTimelines,
+    fetchShow
+  ]);
 
-  // Fetch show when gameState.show_id changes and we don't have the show yet
-  useEffect(() => {
-    const fetchShow = async () => {
-      if (gameState?.show_id && (!currentShow || currentShow.id !== gameState.show_id)) {
-        console.log('[Game] Fetching show from useEffect:', gameState.show_id);
-        const { data: showData, error: showError } = await supabase
-          .from('shows')
-          .select('*')
-          .eq('id', gameState.show_id)
-          .single();
+  // ============================================================================
+  // ROLE CALCULATIONS (memoized)
+  // ============================================================================
 
-        if (showError) {
-          console.error('[Game] Error fetching show in useEffect:', showError);
-        }
-
-        if (showData) {
-          console.log('[Game] Show loaded from useEffect:', showData.show_name);
-          setCurrentShow(showData);
-        }
-      }
-    };
-
-    fetchShow();
-  }, [gameState?.show_id, currentShow]);
-
-  // Fetch timelines when game state changes to ensure they're loaded
-  useEffect(() => {
-    const refreshTimelines = async () => {
-      if (!lobby?.id || !playerId) return;
-      
-      console.log('[Game] Refreshing timelines due to game state change...');
-      const { data: timelinesData } = await supabase
-        .from('timelines')
-        .select('*')
-        .eq('lobby_id', lobby.id)
-        .order('year_value', { ascending: true });
-
-      if (timelinesData) {
-        const timelineMap = new Map<string, Timeline[]>();
-        for (const timeline of timelinesData) {
-          const existing = timelineMap.get(timeline.player_id) || [];
-          timelineMap.set(timeline.player_id, [...existing, timeline]);
-        }
-        setAllTimelines(timelineMap);
-        const myTimelineData = timelineMap.get(playerId) || [];
-        setMyTimeline(myTimelineData);
-        console.log('[Game] Timelines refreshed:', myTimelineData.length, 'years for me,', timelineMap.size, 'players total');
-      }
-    };
-
-    // Refresh timelines when game state round_state changes (e.g., dj_ready -> guessing)
-    if (gameState?.round_state) {
-      refreshTimelines();
-    }
-  }, [gameState?.round_state, lobby?.id, playerId]);
-
-  // Calculate roles (before early return to avoid hook order issues)
-  // Use useMemo to ensure consistent calculation
   const { myPlayer, mySeat, myName, isDj, isGuesser, isHost } = useMemo(() => {
     const foundPlayer = players.find(p => p.id === playerId);
     const seat = foundPlayer?.seat ?? null;
     const name = foundPlayer?.name || 'Unknown';
     
-    // DJ = player whose seat matches current_dj_seat
-    const dj = lobby && gameState && seat !== null && gameState.current_dj_seat !== null && gameState.current_dj_seat === seat;
+    const dj = lobby && gameState && seat !== null && 
+      gameState.current_dj_seat !== null && 
+      gameState.current_dj_seat === seat;
     
-    // Guesser = player whose seat matches current_attempt_seat
-    const guesser = lobby && gameState && seat !== null && gameState.current_attempt_seat !== null && gameState.current_attempt_seat === seat;
+    const guesser = lobby && gameState && seat !== null && 
+      gameState.current_attempt_seat !== null && 
+      gameState.current_attempt_seat === seat;
     
     const host = lobby && playerId && lobby.host_player_id === playerId;
-    
-    // Debug log when roles change
-    if (lobby && gameState && seat !== null) {
-      console.log('[Game] Role calculation:', {
-        myName: name,
-        mySeat: seat,
-        currentDjSeat: gameState.current_dj_seat,
-        currentAttemptSeat: gameState.current_attempt_seat,
-        isDj: dj,
-        isGuesser: guesser,
-        roundState: gameState.round_state
-      });
-    }
     
     return {
       myPlayer: foundPlayer,
@@ -486,7 +894,6 @@ export default function GamePage() {
     };
   }, [players, playerId, lobby, gameState]);
 
-  // Calculate timeline years (before early return)
   const sortedTimeline = useMemo(() => {
     if (!playerId) return [];
     return [...(myTimeline || [])].sort((a, b) => a.year_value - b.year_value);
@@ -496,83 +903,30 @@ export default function GamePage() {
     return [...new Set(sortedTimeline.map(t => t.year_value))];
   }, [sortedTimeline]);
 
-  // Debug: Verify player data is correct
-  useEffect(() => {
-    if (playerId && players.length > 0) {
-      const foundPlayer = players.find(p => p.id === playerId);
-      console.log('[Game] Player data verification:', {
-        playerId,
-        foundPlayer: foundPlayer ? { id: foundPlayer.id, name: foundPlayer.name, seat: foundPlayer.seat } : null,
-        myName,
-        mySeat,
-        timelineYears: uniqueYears,
-        timelineCount: myTimeline.length,
-        allPlayers: players.map(p => ({ id: p.id, name: p.name, seat: p.seat }))
-      });
-    }
-  }, [playerId, players, myName, mySeat, uniqueYears, myTimeline]);
-
-  // Debug: Log player identification
-  useEffect(() => {
-    if (playerId && players.length > 0 && gameState) {
-      const shouldShowGuesserUI = isGuesser && gameState.round_state === 'guessing';
-      console.log('[Game] Player identification:', {
-        playerId,
-        myName,
-        mySeat,
-        currentAttemptSeat: gameState.current_attempt_seat,
-        currentDjSeat: gameState.current_dj_seat,
-        roundState: gameState.round_state,
-        isGuesser,
-        isDj,
-        shouldShowGuesserUI,
-        hasTimeline: uniqueYears.length > 0,
-        timelineYears: uniqueYears,
-        timelineLength: myTimeline.length
-      });
-      
-      if (isGuesser && gameState.round_state === 'guessing' && uniqueYears.length === 0) {
-        console.error('[Game] ERROR: Guesser has no timeline years!', {
-          myTimeline,
-          allTimelines: Array.from(allTimelines.entries())
-        });
-      }
-    }
-  }, [playerId, players, mySeat, myName, isGuesser, isDj, gameState, uniqueYears, myTimeline, allTimelines]);
-
-  // Debug logging (only log when values change to reduce spam)
-  useEffect(() => {
-    if (lobby && gameState && playerId) {
-      console.log('[Game] Role check:', {
-        mySeat,
-        currentAttemptSeat: gameState.current_attempt_seat,
-        currentDjSeat: gameState.current_dj_seat,
-        roundState: gameState.round_state,
-        isGuesser,
-        isDj,
-        isHost,
-        willShowGuesserUI: isGuesser && gameState.round_state === 'guessing'
-      });
-    }
-  }, [lobby, gameState, playerId, mySeat, isGuesser, isDj, isHost]);
-
-  // Redirect to lobby if game is finished (use useEffect to avoid render-time navigation)
+  // Redirect if game finished
   useEffect(() => {
     if (lobby && lobby.status === 'finished') {
-      console.log('[Game] Game finished, redirecting to lobby...');
       router.push(`/lobby/${code}`);
     }
   }, [lobby?.status, code, router]);
 
+  // ============================================================================
+  // EARLY RETURNS
+  // ============================================================================
+
   if (!lobby || !gameState || !playerId) {
     return (
       <div className="flex min-h-screen items-center justify-center">
-        <p className="text-gray-600">Loading game...</p>
+        <div className="text-center">
+          <p className="text-gray-600">Loading game...</p>
+          {connectionStatus === 'reconnecting' && (
+            <p className="text-sm text-yellow-600 mt-2">Reconnecting...</p>
+          )}
+        </div>
       </div>
     );
   }
 
-  // Show redirecting message if game is finished
   if (lobby.status === 'finished') {
     return (
       <div className="flex min-h-screen items-center justify-center">
@@ -581,64 +935,86 @@ export default function GamePage() {
     );
   }
 
-  // Timeline already calculated above in useMemo
+  // ============================================================================
+  // EVENT HANDLERS
+  // ============================================================================
 
   const handleDjReady = async () => {
-    if (!lobby || !playerId) return;
+    if (!lobby || !playerId || !gameState) return;
     
     setLoading(true);
     setError('');
     
     try {
-      console.log('[Game] Marking DJ ready...');
+      console.log('[Game] DJ marking ready...');
       const result = await markDjReady(lobby.id, playerId);
-      console.log('[Game] DJ ready result:', result);
       
       if (!result || typeof result !== 'object') {
         setError('Unexpected response from server');
+        setLoading(false);
         return;
       }
       
       if ('error' in result) {
         setError(result.error);
-      } else {
-        // Success - manually refetch game state and timelines as fallback
-        // This ensures immediate update even if realtime is slow
-        console.log('[Game] DJ ready - refetching game state and timelines');
+        setLoading(false);
+        return;
+      }
+      
+      console.log('[Game] DJ ready action succeeded, refreshing immediately...');
+      
+      // CRITICAL: Refresh game state immediately without delay
+      // Poll until we see the round_state change to 'guessing'
+      let attempts = 0;
+      const maxAttempts = 10;
+      const pollInterval = 100; // Check every 100ms
+      
+      while (attempts < maxAttempts && isMountedRef.current) {
+        const updatedGameState = await fetchGameState(lobby.id);
         
-        // Refetch game state
-        const { data: updatedGameState } = await supabase
-          .from('game_state')
-          .select('*')
-          .eq('lobby_id', lobby.id)
-          .single();
-        
-        if (updatedGameState) {
-          console.log('[Game] Updated game state:', updatedGameState.round_state);
+        if (updatedGameState && isMountedRef.current) {
+          console.log('[Game] Polled game state:', {
+            round_state: updatedGameState.round_state,
+            previous: gameState.round_state
+          });
+          
+          // Update state immediately
+          gameStateRef.current = updatedGameState;
           setGameState(updatedGameState);
+          
+          // If round state changed to 'guessing', we're done
+          if (updatedGameState.round_state === 'guessing') {
+            console.log('[Game] Round state changed to guessing!');
+            
+            // Also refresh attempts and timelines
+            const [attemptsData, timelinesMap] = await Promise.all([
+              fetchAttempts(lobby.id, updatedGameState.current_round_number),
+              fetchTimelines(lobby.id)
+            ]);
+            
+            if (attemptsData && isMountedRef.current) {
+              setAttempts(attemptsData);
+            }
+            
+            if (timelinesMap && isMountedRef.current) {
+              setAllTimelines(timelinesMap);
+              if (playerId) {
+                const myTimelineData = timelinesMap.get(playerId) || [];
+                setMyTimeline(myTimelineData);
+              }
+            }
+            
+            break;
+          }
         }
-
-        // Refetch timelines
-        const { data: timelinesData } = await supabase
-          .from('timelines')
-          .select('*')
-          .eq('lobby_id', lobby.id)
-          .order('year_value', { ascending: true });
-
-        if (timelinesData) {
-          const timelineMap = new Map<string, Timeline[]>();
-          for (const timeline of timelinesData) {
-            const existing = timelineMap.get(timeline.player_id) || [];
-            timelineMap.set(timeline.player_id, [...existing, timeline]);
-          }
-          setAllTimelines(timelineMap);
-          if (playerId) {
-            const myTimelineData = timelineMap.get(playerId) || [];
-            setMyTimeline(myTimelineData);
-            console.log('[Game] Timelines refreshed:', myTimelineData.length, 'years');
-          }
+        
+        attempts++;
+        if (attempts < maxAttempts) {
+          await new Promise(resolve => setTimeout(resolve, pollInterval));
         }
       }
+      
+      // Subscriptions will handle further updates automatically
     } catch (err) {
       console.error('[Game] Error marking DJ ready:', err);
       setError('Failed to mark ready. Please try again.');
@@ -648,9 +1024,20 @@ export default function GamePage() {
   };
 
   const handleSubmitGuess = async () => {
+    // Prevent multiple submissions
+    if (isSubmitting || loading) {
+      return;
+    }
+    
     if (!lobby || !playerId || !gameState) return;
+    
+    // Verify it's still this player's turn
+    const currentPlayer = players.find(p => p.id === playerId);
+    if (!currentPlayer || currentPlayer.seat !== gameState.current_attempt_seat) {
+      setError('It is not your turn to guess');
+      return;
+    }
 
-    // Determine guess type and values
     let guessType: GuessType;
     let xYear: number;
     let yYear: number | null = null;
@@ -664,8 +1051,6 @@ export default function GamePage() {
       yYear = selectedBetweenYears[1];
     } else if (selectedAfterYear !== null) {
       guessType = 'after';
-      // For 'after', we pass the year as yYear
-      // The logic checks: premiere_year >= yYear (meaning after that year)
       xYear = selectedAfterYear;
       yYear = selectedAfterYear;
     } else {
@@ -673,11 +1058,12 @@ export default function GamePage() {
       return;
     }
 
+    // Set submitting flag and loading state
+    setIsSubmitting(true);
     setLoading(true);
     setError('');
 
     try {
-      console.log('[Game] Submitting guess:', { guessType, xYear, yYear });
       const result = await submitAttempt(
         lobby.id,
         playerId,
@@ -688,141 +1074,170 @@ export default function GamePage() {
 
       if ('error' in result) {
         setError(result.error);
-      } else {
-        // Success - reset selection
-        setSelectedBeforeYear(null);
-        setSelectedBetweenYears(null);
-        setSelectedAfterYear(null);
-        console.log('[Game] Guess submitted successfully:', result);
+        setIsSubmitting(false);
+        setLoading(false);
+        return;
+      }
+      
+      // Reset selection immediately to prevent re-submission
+      setSelectedBeforeYear(null);
+      setSelectedBetweenYears(null);
+      setSelectedAfterYear(null);
+      
+      console.log('[Game] Guess submitted successfully, polling for state update...');
+      
+      // CRITICAL: Poll until we see the state change
+      // State will change to either:
+      // - 'revealed' if correct (or DJ failed)
+      // - 'guessing' with new attempt_seat if wrong
+      let attempts = 0;
+      const maxAttempts = 15; // More attempts since we might need to wait for next guesser
+      const pollInterval = 100;
+      
+      const previousAttemptSeat = gameState.current_attempt_seat;
+      const previousRoundState = gameState.round_state;
+      
+      while (attempts < maxAttempts && isMountedRef.current) {
+        const [updatedGameState, attemptsData, timelinesMap] = await Promise.all([
+          fetchGameState(lobby.id),
+          fetchAttempts(lobby.id, gameState.current_round_number),
+          fetchTimelines(lobby.id)
+        ]);
         
-        // Manually refetch game state and timelines to ensure all players see the update
-        // This is similar to what we do for markDjReady
-        console.log('[Game] Refetching game state and timelines after guess...');
-        
-        // Refetch game state
-        const { data: updatedGameState } = await supabase
-          .from('game_state')
-          .select('*')
-          .eq('lobby_id', lobby.id)
-          .single();
-        
-        if (updatedGameState) {
-          console.log('[Game] Updated game state after guess:', {
+        if (updatedGameState && isMountedRef.current) {
+          console.log('[Game] Polled game state after guess:', {
             round_state: updatedGameState.round_state,
-            current_attempt_seat: updatedGameState.current_attempt_seat,
-            isCorrect: result.isCorrect
+            attempt_seat: updatedGameState.current_attempt_seat,
+            previous_attempt_seat: previousAttemptSeat,
+            previous_round_state: previousRoundState
           });
+          
+          // Update state immediately
+          gameStateRef.current = updatedGameState;
           setGameState(updatedGameState);
-        }
-
-        // Refetch timelines (in case a correct guess added a year)
-        const { data: timelinesData } = await supabase
-          .from('timelines')
-          .select('*')
-          .eq('lobby_id', lobby.id)
-          .order('year_value', { ascending: true });
-
-        if (timelinesData) {
-          const timelineMap = new Map<string, Timeline[]>();
-          for (const timeline of timelinesData) {
-            const existing = timelineMap.get(timeline.player_id) || [];
-            timelineMap.set(timeline.player_id, [...existing, timeline]);
-          }
-          setAllTimelines(timelineMap);
-          if (playerId) {
-            const myTimelineData = timelineMap.get(playerId) || [];
-            setMyTimeline(myTimelineData);
-            console.log('[Game] Timelines refreshed after guess:', myTimelineData.length, 'years');
-          }
-        }
-
-        // Refetch attempts to show the new attempt
-        if (updatedGameState) {
-          const { data: attemptsData } = await supabase
-            .from('attempts')
-            .select('*')
-            .eq('lobby_id', lobby.id)
-            .eq('round_number', updatedGameState.current_round_number)
-            .order('attempt_order', { ascending: true });
-
-          if (attemptsData) {
+          
+          if (attemptsData && isMountedRef.current) {
             setAttempts(attemptsData);
-            console.log('[Game] Attempts refreshed:', attemptsData.length);
           }
+          
+          if (timelinesMap && isMountedRef.current) {
+            setAllTimelines(timelinesMap);
+            if (playerId) {
+              const myTimelineData = timelinesMap.get(playerId) || [];
+              setMyTimeline(myTimelineData);
+            }
+          }
+          
+          // Check if state changed (either round revealed or next guesser's turn)
+          const stateChanged = 
+            updatedGameState.round_state !== previousRoundState || // Round state changed
+            (updatedGameState.round_state === 'guessing' && 
+             updatedGameState.current_attempt_seat !== previousAttemptSeat); // Next guesser's turn
+          
+          if (stateChanged) {
+            console.log('[Game] State changed after guess submission!');
+            
+            // Fetch show if needed
+            if (updatedGameState.show_id) {
+              const showData = await fetchShow(updatedGameState.show_id);
+              if (showData && isMountedRef.current) {
+                setCurrentShow(showData);
+              }
+            }
+            
+            break;
+          }
+        }
+        
+        attempts++;
+        if (attempts < maxAttempts) {
+          await new Promise(resolve => setTimeout(resolve, pollInterval));
         }
       }
+      // Subscriptions will handle other updates automatically
     } catch (err) {
       console.error('[Game] Error submitting guess:', err);
       setError('Failed to submit guess. Please try again.');
     } finally {
+      setIsSubmitting(false);
       setLoading(false);
     }
   };
 
   const handleAdvanceRound = async () => {
-    if (!isHost || !lobby || !playerId) return;
+    if (!isHost || !lobby || !playerId || !gameState) return;
     setLoading(true);
     setError('');
     
     try {
+      console.log('[Game] Host advancing round...');
       const result = await advanceRound(lobby.id, playerId);
       
       if ('error' in result) {
         setError(result.error);
-      } else {
-        // Success - manually refetch game state, show, and timelines
-        console.log('[Game] Round advanced - refetching game state...');
+        setLoading(false);
+        return;
+      }
+      
+      console.log('[Game] Round advance action succeeded, polling for new round...');
+      
+      // CRITICAL: Poll until we see the new round start
+      const previousRoundNumber = gameState.current_round_number;
+      let attempts = 0;
+      const maxAttempts = 15;
+      const pollInterval = 100;
+      
+      while (attempts < maxAttempts && isMountedRef.current) {
+        const [updatedGameState, timelinesMap] = await Promise.all([
+          fetchGameState(lobby.id),
+          fetchTimelines(lobby.id)
+        ]);
         
-        // Refetch game state
-        const { data: updatedGameState } = await supabase
-          .from('game_state')
-          .select('*')
-          .eq('lobby_id', lobby.id)
-          .single();
-        
-        if (updatedGameState) {
-          console.log('[Game] Updated game state after advance:', {
-            round_state: updatedGameState.round_state,
-            current_round_number: updatedGameState.current_round_number
+        if (updatedGameState && isMountedRef.current) {
+          console.log('[Game] Polled game state after advance:', {
+            round_number: updatedGameState.current_round_number,
+            previous_round: previousRoundNumber,
+            round_state: updatedGameState.round_state
           });
+          
+          // Update state immediately
+          gameStateRef.current = updatedGameState;
           setGameState(updatedGameState);
           
-          // Fetch new show
-          if (updatedGameState.show_id) {
-            const { data: showData } = await supabase
-              .from('shows')
-              .select('*')
-              .eq('id', updatedGameState.show_id)
-              .single();
-            if (showData) {
-              setCurrentShow(showData);
+          if (timelinesMap && isMountedRef.current) {
+            setAllTimelines(timelinesMap);
+            if (playerId) {
+              const myTimelineData = timelinesMap.get(playerId) || [];
+              setMyTimeline(myTimelineData);
             }
           }
-        }
-
-        // Refetch timelines
-        const { data: timelinesData } = await supabase
-          .from('timelines')
-          .select('*')
-          .eq('lobby_id', lobby.id)
-          .order('year_value', { ascending: true });
-
-        if (timelinesData) {
-          const timelineMap = new Map<string, Timeline[]>();
-          for (const timeline of timelinesData) {
-            const existing = timelineMap.get(timeline.player_id) || [];
-            timelineMap.set(timeline.player_id, [...existing, timeline]);
-          }
-          setAllTimelines(timelineMap);
-          if (playerId) {
-            const myTimelineData = timelineMap.get(playerId) || [];
-            setMyTimeline(myTimelineData);
+          
+          // Check if round number increased (new round started)
+          if (updatedGameState.current_round_number > previousRoundNumber) {
+            console.log('[Game] New round detected!');
+            
+            // Fetch new show
+            if (updatedGameState.show_id) {
+              const showData = await fetchShow(updatedGameState.show_id);
+              if (showData && isMountedRef.current) {
+                setCurrentShow(showData);
+              }
+            }
+            
+            // Clear attempts for new round
+            setAttempts([]);
+            
+            break;
           }
         }
-
-        // Clear attempts for new round
-        setAttempts([]);
+        
+        attempts++;
+        if (attempts < maxAttempts) {
+          await new Promise(resolve => setTimeout(resolve, pollInterval));
+        }
       }
+      
+      // Subscriptions will handle further updates automatically
     } catch (err) {
       console.error('[Game] Error advancing round:', err);
       setError('Failed to advance round. Please try again.');
@@ -831,19 +1246,40 @@ export default function GamePage() {
     }
   };
 
-  const getPlayerName = (seat: number | null) => {
+  // ============================================================================
+  // HELPER FUNCTIONS
+  // ============================================================================
+
+  const getPlayerName = (seat: number | null): string => {
     if (seat === null) return 'Unknown';
     const player = players.find(p => p.seat === seat);
     return player?.name || 'Unknown';
   };
 
-  const getPlayerScore = (playerId: string) => {
-    return allTimelines.get(playerId)?.length || 0;
+  const getPlayerScore = (pId: string): number => {
+    return allTimelines.get(pId)?.length || 0;
   };
+
+  // ============================================================================
+  // RENDER
+  // ============================================================================
 
   return (
     <div className="flex min-h-screen flex-col bg-gradient-to-br from-purple-50 to-blue-50 p-4">
       <div className="mx-auto w-full max-w-2xl space-y-4">
+        {/* Connection Status Indicator */}
+        {connectionStatus !== 'connected' && (
+          <div className={`rounded-lg p-2 text-center text-sm ${
+            connectionStatus === 'reconnecting' 
+              ? 'bg-yellow-50 text-yellow-700' 
+              : 'bg-red-50 text-red-700'
+          }`}>
+            {connectionStatus === 'reconnecting' 
+              ? 'Reconnecting...' 
+              : 'Connection lost. Using fallback updates.'}
+          </div>
+        )}
+
         {/* Header */}
         <div className="rounded-2xl bg-white p-4 shadow-lg">
           <div className="flex items-center justify-between">
@@ -909,7 +1345,7 @@ export default function GamePage() {
                       {isCurrentlyGuessing && (
                         <span className="text-purple-600 font-bold text-lg">→</span>
                       )}
-                      {isDj && !isCurrentlyGuessing && (
+                      {playerIsDj && !isCurrentlyGuessing && (
                         <span className="text-blue-600 text-sm">🎧</span>
                       )}
                       <span className={player.id === playerId ? 'font-semibold text-purple-600' : 'text-gray-700'}>
@@ -940,13 +1376,7 @@ export default function GamePage() {
         )}
 
         {/* DJ Interface */}
-        {(() => {
-          const shouldShowDj = isDj && gameState.round_state === 'dj_ready';
-          if (shouldShowDj) {
-            console.log('[Game] Showing DJ interface for:', { mySeat, currentDjSeat: gameState.current_dj_seat, myName });
-          }
-          return shouldShowDj;
-        })() && (
+        {isDj && gameState.round_state === 'dj_ready' && (
           <div className="rounded-2xl bg-white p-4 shadow-lg border-2 border-blue-500">
             <h2 className="mb-3 text-lg font-semibold text-gray-900">DJ - Play the Theme Song</h2>
             {currentShow ? (
@@ -980,42 +1410,26 @@ export default function GamePage() {
                 <p className="text-sm text-yellow-800 font-semibold mb-2">
                   Loading show information...
                 </p>
-                {gameState.show_id ? (
-                  <>
-                    <p className="text-xs text-yellow-600 mb-2">Show ID: {gameState.show_id}</p>
-                    <button
-                      onClick={async () => {
-                        console.log('[Game] Manually fetching show:', gameState.show_id);
-                        const { data: showData } = await supabase
-                          .from('shows')
-                          .select('*')
-                          .eq('id', gameState.show_id)
-                          .single();
-                        if (showData) {
-                          setCurrentShow(showData);
-                        }
-                      }}
-                      className="text-xs bg-yellow-200 hover:bg-yellow-300 px-3 py-1 rounded"
-                    >
-                      Retry Load Show
-                    </button>
-                  </>
-                ) : (
-                  <p className="text-xs text-yellow-600">No show ID available yet</p>
+                {gameState.show_id && (
+                  <button
+                    onClick={async () => {
+                      const showData = await fetchShow(gameState.show_id!);
+                      if (showData) {
+                        setCurrentShow(showData);
+                      }
+                    }}
+                    className="text-xs bg-yellow-200 hover:bg-yellow-300 px-3 py-1 rounded"
+                  >
+                    Retry Load Show
+                  </button>
                 )}
               </div>
             )}
           </div>
         )}
 
-        {/* Guesser Interface - Timeline Based */}
-        {(() => {
-          const shouldShow = isGuesser && gameState.round_state === 'guessing';
-          if (shouldShow) {
-            console.log('[Game] Showing Guesser interface for:', { mySeat, currentAttemptSeat: gameState.current_attempt_seat, myName });
-          }
-          return shouldShow;
-        })() ? (
+        {/* Guesser Interface */}
+        {isGuesser && gameState.round_state === 'guessing' && (
           <div className="rounded-2xl bg-white p-4 shadow-lg border-2 border-purple-500">
             <h2 className="mb-3 text-lg font-semibold text-gray-900">Your Turn to Guess</h2>
             <p className="mb-3 text-sm text-gray-600">Select where you think the show premiered relative to your timeline.</p>
@@ -1028,11 +1442,9 @@ export default function GamePage() {
               </div>
             ) : (
               <>
-                {/* Timeline Display - Horizontal with buttons */}
                 <div className="mb-4">
                   <label className="block text-sm font-medium text-gray-700 mb-3">Your Timeline</label>
                   <div className="flex items-center gap-2 flex-wrap justify-center">
-                    {/* Before first year button */}
                     <button
                       onClick={() => {
                         setSelectedBeforeYear(uniqueYears[0]);
@@ -1048,9 +1460,7 @@ export default function GamePage() {
                       &lt; {uniqueYears[0]}
                     </button>
 
-                    {/* Years with between selection */}
                     {uniqueYears.map((year, index) => {
-                      const isFirst = index === 0;
                       const isLast = index === uniqueYears.length - 1;
                       const nextYear = uniqueYears[index + 1];
                       const isSelectedInBetween = selectedBetweenYears && 
@@ -1062,15 +1472,9 @@ export default function GamePage() {
                           <button
                             onClick={() => {
                               if (canSelectAsBetween) {
-                                // Toggle between selection
                                 if (selectedBetweenYears && selectedBetweenYears[0] === year && selectedBetweenYears[1] === nextYear) {
-                                  // Deselect if already selected
                                   setSelectedBetweenYears(null);
-                                } else if (selectedBetweenYears && selectedBetweenYears[0] === year) {
-                                  // Already have first year, set second
-                                  setSelectedBetweenYears([year, nextYear]);
                                 } else {
-                                  // Start new selection
                                   setSelectedBetweenYears([year, nextYear]);
                                 }
                                 setSelectedBeforeYear(null);
@@ -1088,14 +1492,11 @@ export default function GamePage() {
                           >
                             {year}
                           </button>
-                          {!isLast && (
-                            <span className="text-gray-400">—</span>
-                          )}
+                          {!isLast && <span className="text-gray-400">—</span>}
                         </div>
                       );
                     })}
 
-                    {/* After last year button */}
                     <button
                       onClick={() => {
                         setSelectedAfterYear(uniqueYears[uniqueYears.length - 1]);
@@ -1113,7 +1514,6 @@ export default function GamePage() {
                   </div>
                 </div>
 
-                {/* Selection Display */}
                 {selectedBeforeYear !== null && (
                   <div className="mb-4 rounded-lg bg-purple-50 p-3">
                     <p className="text-sm text-gray-700">
@@ -1142,40 +1542,32 @@ export default function GamePage() {
                   onClick={handleSubmitGuess}
                   disabled={
                     loading ||
-                    (selectedBeforeYear === null && selectedBetweenYears === null && selectedAfterYear === null)
+                    isSubmitting ||
+                    (selectedBeforeYear === null && selectedBetweenYears === null && selectedAfterYear === null) ||
+                    !isGuesser ||
+                    gameState.round_state !== 'guessing' ||
+                    gameState.current_attempt_seat !== mySeat
                   }
-                  className="w-full rounded-lg bg-purple-600 px-4 py-3 font-medium text-white transition-colors hover:bg-purple-700 disabled:opacity-50"
+                  className="w-full rounded-lg bg-purple-600 px-4 py-3 font-medium text-white transition-colors hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  {loading ? 'Submitting...' : 'Submit Guess'}
+                  {loading || isSubmitting ? 'Submitting...' : 'Submit Guess'}
                 </button>
               </>
             )}
           </div>
-        ) : gameState.round_state === 'guessing' && !isGuesser ? (
+        )}
+
+        {/* Waiting for Guess */}
+        {gameState.round_state === 'guessing' && !isGuesser && (
           <div className="rounded-2xl bg-white p-4 shadow-lg border-2 border-gray-200">
             <h2 className="mb-3 text-lg font-semibold text-gray-900">Waiting for Guess</h2>
             <p className="text-sm text-gray-600">
               {getPlayerName(gameState.current_attempt_seat)} is currently guessing...
             </p>
-            <p className="text-xs text-gray-500 mt-2">
-              Your seat: {mySeat !== null ? mySeat : 'Not assigned'} | Attempting: {gameState.current_attempt_seat}
-            </p>
           </div>
-        ) : gameState.round_state === 'guessing' ? (
-          <div className="rounded-2xl bg-red-50 p-4 shadow-lg border-2 border-red-500">
-            <h2 className="mb-3 text-lg font-semibold text-red-900">DEBUG: Guessing mode but interface not showing</h2>
-            <div className="text-sm space-y-1">
-              <p>isGuesser: {isGuesser ? 'true' : 'false'}</p>
-              <p>round_state: {gameState.round_state}</p>
-              <p>mySeat: {mySeat !== null ? mySeat : 'null'}</p>
-              <p>current_attempt_seat: {gameState.current_attempt_seat}</p>
-              <p>Match: {mySeat === gameState.current_attempt_seat ? 'YES' : 'NO'}</p>
-              <p>Timeline years: {uniqueYears.length}</p>
-            </div>
-          </div>
-        ) : null}
+        )}
 
-        {/* Attempts List - Show all attempts with results */}
+        {/* Attempts List - CRITICAL: Show all attempts including incorrect ones */}
         {attempts.length > 0 && (
           <div className="rounded-2xl bg-white p-4 shadow-lg">
             <h2 className="mb-3 text-lg font-semibold text-gray-900">Attempts (Round {gameState.current_round_number})</h2>
@@ -1233,7 +1625,6 @@ export default function GamePage() {
               <p className="text-xl font-bold text-purple-600">Premiered: {currentShow.premiere_year}</p>
             </div>
             {lobby.status === 'finished' ? (
-              // Game is over - show return to lobby button for everyone
               <button
                 onClick={() => router.push(`/lobby/${code}`)}
                 className="mt-4 w-full rounded-lg bg-purple-600 px-4 py-3 font-medium text-white transition-colors hover:bg-purple-700"
@@ -1241,7 +1632,6 @@ export default function GamePage() {
                 Return to Lobby
               </button>
             ) : isHost ? (
-              // Game still in progress - host can advance round
               <button
                 onClick={handleAdvanceRound}
                 disabled={loading}
@@ -1250,7 +1640,6 @@ export default function GamePage() {
                 {loading ? 'Loading...' : 'Next Round'}
               </button>
             ) : (
-              // Non-host waiting for next round
               <div className="mt-4 rounded-lg bg-blue-50 p-3 text-center text-sm text-gray-700">
                 Waiting for host to start next round...
               </div>
@@ -1280,4 +1669,3 @@ export default function GamePage() {
     </div>
   );
 }
-

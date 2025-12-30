@@ -36,7 +36,7 @@ export async function startGame(lobbyId: string, hostPlayerId: string): Promise<
       .delete()
       .eq('lobby_id', lobbyId);
 
-    // Get all players
+    // Get all players ordered by join time
     const { data: players, error: playersError } = await supabaseAdmin
       .from('players')
       .select('id')
@@ -47,9 +47,21 @@ export async function startGame(lobbyId: string, hostPlayerId: string): Promise<
       return { error: 'Need at least 2 players to start' };
     }
 
-    // Assign random seats
-    const shuffled = [...players].sort(() => Math.random() - 0.5);
-    const seatAssignments = shuffled.map((player, index) => ({
+    // Assign seats in join order: Host gets seat 0, others get seats 1, 2, 3...
+    // First, find the host and put them first
+    const hostIndex = players.findIndex(p => p.id === hostPlayerId);
+    if (hostIndex === -1) {
+      return { error: 'Host not found in players list' };
+    }
+
+    // Reorder: host first, then others in join order
+    const orderedPlayers = [
+      players[hostIndex], // Host is first
+      ...players.filter((_, index) => index !== hostIndex) // Others in order
+    ];
+
+    // Assign seats: host = 0, second player = 1, third = 2, etc.
+    const seatAssignments = orderedPlayers.map((player, index) => ({
       playerId: player.id,
       seat: index,
     }));
@@ -89,8 +101,9 @@ export async function startGame(lobbyId: string, hostPlayerId: string): Promise<
     const shuffledYears = [...uniqueYears].sort(() => Math.random() - 0.5);
 
     // Give each player 2 DIFFERENT random starting years
-    for (let i = 0; i < players.length; i++) {
-      const player = players[i];
+    // Use orderedPlayers to match seat assignments
+    for (let i = 0; i < orderedPlayers.length; i++) {
+      const player = orderedPlayers[i];
       // Each player gets 2 unique years from different positions in the shuffled array
       const yearIndex1 = i * 2;
       const yearIndex2 = (i * 2) + 1;
@@ -144,8 +157,10 @@ export async function startGame(lobbyId: string, hostPlayerId: string): Promise<
     const randomShow = allShows[Math.floor(Math.random() * allShows.length)];
 
     // Initialize game state
-    const firstGuesserSeat = 0;
-    const firstDjSeat = (firstGuesserSeat + 1) % players.length;
+    // Host (seat 0) is always the first DJ
+    // Second player (seat 1) is always the first guesser
+    const firstDjSeat = 0; // Host is always DJ first
+    const firstGuesserSeat = 1; // Second player is always first guesser
 
     const { error: gameStateError } = await supabaseAdmin
       .from('game_state')
