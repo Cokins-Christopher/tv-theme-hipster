@@ -441,18 +441,17 @@ export async function advanceRound(lobbyId: string, hostPlayerId: string): Promi
 
     const randomShow = showsToUse[Math.floor(Math.random() * showsToUse.length)];
 
-    // The new DJ should be whoever just guessed correctly (the person who made the correct attempt)
+    // The new DJ should be the ORIGINAL guesser (current_guesser_seat), not who actually guessed correctly
+    // This ensures proper rotation: if Player 2 was the original guesser but Player 3 guessed correctly,
+    // Player 2 becomes the DJ (not Player 3), maintaining the rotation order
     // The new guesser should be the person right after the new DJ
-    // IMPORTANT: Use current_attempt_seat (who actually guessed) not current_guesser_seat (original guesser)
-    // because if the original guesser was wrong, the attempt moved to the next player
-    const previousAttemptSeat = gameState.current_attempt_seat ?? gameState.current_guesser_seat ?? 0;
-    const newDjSeat = previousAttemptSeat; // DJ is the person who just guessed correctly
+    const originalGuesserSeat = gameState.current_guesser_seat ?? 0;
+    const newDjSeat = originalGuesserSeat; // DJ is the original guesser
     const newGuesserSeat = (newDjSeat + 1) % players.length; // Guesser is right after the DJ
 
     console.log('[advanceRound] Role assignment:', {
-      previousAttemptSeat,
-      previousGuesserSeat: gameState.current_guesser_seat,
-      currentAttemptSeat: gameState.current_attempt_seat,
+      originalGuesserSeat: gameState.current_guesser_seat,
+      actualGuesserSeat: gameState.current_attempt_seat,
       newDjSeat,
       newGuesserSeat,
       playersCount: players.length

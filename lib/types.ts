@@ -5,6 +5,7 @@ export interface Show {
   artist: string;
   premiere_year: number;
   youtube_url: string;
+  youtube_video_id: string | null;
   created_at: string;
 }
 

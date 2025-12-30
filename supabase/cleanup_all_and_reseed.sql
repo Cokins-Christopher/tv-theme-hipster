@@ -1,7 +1,18 @@
--- Seed data for TV Theme Hipster Game
--- Uses YouTube SEARCH URLs - the app will automatically resolve to the first video
--- Video IDs are cached in youtube_video_id column after first resolution
+-- Complete cleanup: Delete all shows and reseed with search URLs only
+-- Use this if you want a clean slate
 
+-- IMPORTANT: Delete in order to respect foreign key constraints
+-- First, delete all game-related data that references shows
+DELETE FROM attempts;
+DELETE FROM timelines;
+DELETE FROM game_state;
+DELETE FROM players;
+DELETE FROM lobbies;
+
+-- Now safe to delete all shows
+DELETE FROM shows;
+
+-- Reseed with search URLs only
 INSERT INTO shows (show_name, network, artist, premiere_year, youtube_url) VALUES
 ('Friends', 'NBC', 'The Rembrandts', 1994, 'https://www.youtube.com/results?search_query=friends+tv+show+opening+theme'),
 ('The Simpsons', 'Fox', 'Danny Elfman', 1989, 'https://www.youtube.com/results?search_query=the+simpsons+opening+theme'),
@@ -27,3 +38,4 @@ INSERT INTO shows (show_name, network, artist, premiere_year, youtube_url) VALUE
 ('Better Call Saul', 'AMC', 'Little Barrie', 2015, 'https://www.youtube.com/results?search_query=better+call+saul+opening+theme'),
 ('The Handmaid''s Tale', 'Hulu', 'Adam Taylor', 2017, 'https://www.youtube.com/results?search_query=the+handmaids+tale+opening+theme'),
 ('Succession', 'HBO', 'Nicholas Britell', 2018, 'https://www.youtube.com/results?search_query=succession+hbo+opening+theme');
+

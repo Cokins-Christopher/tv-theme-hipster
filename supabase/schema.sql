@@ -12,6 +12,7 @@ CREATE TABLE shows (
   artist TEXT NOT NULL,
   premiere_year INTEGER NOT NULL,
   youtube_url TEXT NOT NULL,
+  youtube_video_id TEXT, -- Cached video ID resolved from search URLs
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 

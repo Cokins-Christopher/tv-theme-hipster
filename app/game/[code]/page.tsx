@@ -4,6 +4,7 @@ import { useEffect, useState, useMemo, useRef, useCallback } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase/client';
 import { submitAttempt, markDjReady, advanceRound } from '@/app/actions/game';
+import { resolveShowVideoId } from '@/app/actions/shows';
 import { getPlayerId } from '@/lib/utils/player';
 import type { GameState, Player, Timeline, Attempt, Show, Lobby } from '@/lib/types';
 import type { GuessType } from '@/lib/types';
@@ -71,10 +72,11 @@ export default function GamePage() {
   // STABLE DATA FETCHING FUNCTIONS (no dependencies to prevent loops)
   // ============================================================================
 
-  const fetchShow = useCallback(async (showId: string): Promise<Show | null> => {
+  const fetchShow = useCallback(async (showId: string, retryCount = 0): Promise<Show | null> => {
     if (!isMountedRef.current) return null;
     
     try {
+      console.log(`[Game] Fetching show (attempt ${retryCount + 1}):`, showId);
       const { data: showData, error: showError } = await supabase
         .from('shows')
         .select('*')
@@ -83,10 +85,42 @@ export default function GamePage() {
 
       if (showError) {
         console.error('[Game] Error fetching show:', showError);
+        if (retryCount < 3) { // Max 3 retries
+          await new Promise(resolve => setTimeout(resolve, ACTION_UPDATE_DELAY * (retryCount + 1)));
+          return fetchShow(showId, retryCount + 1);
+        }
         return null;
       }
-
-      return showData || null;
+      
+      if (showData) {
+        console.log('[Game] Show loaded:', showData.show_name);
+        
+        // If it's a search URL and we don't have a video ID yet, resolve it
+        if (showData.youtube_url.includes('results?search_query=') && !showData.youtube_video_id) {
+          console.log('[Game] Resolving video ID from search URL...');
+          const resolveResult = await resolveShowVideoId(showId);
+          
+          if ('videoId' in resolveResult) {
+            // Refetch the show to get the updated video ID
+            const { data: updatedShow } = await supabase
+              .from('shows')
+              .select('*')
+              .eq('id', showId)
+              .single();
+            
+            if (updatedShow) {
+              console.log('[Game] Video ID resolved:', resolveResult.videoId);
+              return updatedShow;
+            }
+          } else {
+            console.error('[Game] Failed to resolve video ID:', resolveResult.error);
+          }
+        }
+        
+        return showData;
+      }
+      
+      return null;
     } catch (err) {
       console.error('[Game] Exception fetching show:', err);
       return null;
@@ -1381,18 +1415,56 @@ export default function GamePage() {
             <h2 className="mb-3 text-lg font-semibold text-gray-900">DJ - Play the Theme Song</h2>
             {currentShow ? (
               <div className="space-y-3">
-                <div className="aspect-video w-full overflow-hidden rounded-lg bg-gray-900">
-                  <iframe
-                    width="100%"
-                    height="100%"
-                    src={currentShow.youtube_url.replace('watch?v=', 'embed/')}
-                    title={currentShow.show_name}
-                    frameBorder="0"
-                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-                    allowFullScreen
-                    className="h-full w-full"
-                  />
-                </div>
+                {/* Check if we have a video ID to embed, or if it's a direct video URL */}
+                {currentShow.youtube_video_id ? (
+                  // We have a video ID - embed it
+                  <div className="aspect-video w-full overflow-hidden rounded-lg bg-gray-900">
+                    <iframe
+                      width="100%"
+                      height="100%"
+                      src={`https://www.youtube.com/embed/${currentShow.youtube_video_id}`}
+                      title={currentShow.show_name}
+                      frameBorder="0"
+                      allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                      allowFullScreen
+                      className="h-full w-full"
+                    />
+                  </div>
+                ) : currentShow.youtube_url.includes('results?search_query=') ? (
+                  // Search URL without resolved video ID - show loading/retry
+                  <div className="aspect-video w-full flex items-center justify-center rounded-lg bg-gray-900">
+                    <div className="text-center text-white p-6">
+                      <p className="text-lg font-semibold mb-4">{currentShow.show_name}</p>
+                      <p className="text-sm text-gray-300 mb-4">{currentShow.network} • {currentShow.artist}</p>
+                      <p className="text-sm text-gray-400 mb-4">Resolving video...</p>
+                      <button
+                        onClick={async () => {
+                          const showData = await fetchShow(currentShow!.id);
+                          if (showData) {
+                            setCurrentShow(showData);
+                          }
+                        }}
+                        className="inline-block rounded-lg bg-red-600 px-6 py-3 font-medium text-white transition-colors hover:bg-red-700"
+                      >
+                        Retry Resolve Video
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  // Direct video URL - extract video ID and embed
+                  <div className="aspect-video w-full overflow-hidden rounded-lg bg-gray-900">
+                    <iframe
+                      width="100%"
+                      height="100%"
+                      src={currentShow.youtube_url.replace('watch?v=', 'embed/')}
+                      title={currentShow.show_name}
+                      frameBorder="0"
+                      allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                      allowFullScreen
+                      className="h-full w-full"
+                    />
+                  </div>
+                )}
                 <div className="text-center text-sm text-gray-600">
                   <p className="font-semibold">{currentShow.show_name}</p>
                   <p>{currentShow.network} • {currentShow.artist}</p>
