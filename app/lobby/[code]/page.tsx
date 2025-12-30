@@ -307,27 +307,41 @@ export default function LobbyPage() {
   };
 
   if (!lobby) {
-    return (
-      <div className="flex min-h-screen items-center justify-center">
-        <div className="text-center">
-          <p className="text-gray-600">Loading lobby...</p>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex min-h-screen flex-col bg-gradient-to-br from-purple-50 to-blue-50 p-4">
-      <div className="mx-auto w-full max-w-2xl space-y-6 rounded-2xl bg-white p-6 shadow-xl">
-        <div className="text-center">
-          <h1 className="text-3xl font-bold text-gray-900">Lobby</h1>
-          <div className="mt-2">
-            <p className="text-sm text-gray-600">Join Code</p>
-            <p className="text-3xl font-mono font-bold tracking-widest text-purple-600">
-              {code.toUpperCase()}
-            </p>
+        return (
+          <div className="flex min-h-screen items-center justify-center">
+            <div className="text-center">
+              <p className="text-gray-600">Loading lobby...</p>
+            </div>
           </div>
-        </div>
+        );
+      }
+
+      return (
+        <div className="flex min-h-screen flex-col bg-gradient-to-br from-purple-50 to-blue-50 p-4">
+          <div className="mx-auto w-full max-w-2xl space-y-6 rounded-2xl bg-white p-6 shadow-xl">
+            <div className="text-center">
+              <h1 className="text-3xl font-bold text-gray-900">Lobby</h1>
+              <div className="mt-2">
+                <p className="text-sm text-gray-600">Join Code</p>
+                <p className="text-3xl font-mono font-bold tracking-widest text-purple-600">
+                  {code.toUpperCase()}
+                </p>
+              </div>
+            </div>
+
+            {/* Exit Lobby Button */}
+            <div className="border-t border-gray-200 pt-4">
+              <button
+                onClick={() => {
+                  if (confirm('Are you sure you want to leave the lobby? You can rejoin later with the same join code.')) {
+                    router.push('/');
+                  }
+                }}
+                className="w-full rounded-lg border-2 border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50"
+              >
+                Exit Lobby
+              </button>
+            </div>
 
         {error && (
           <div className="rounded-lg bg-red-50 p-3 text-sm text-red-600">

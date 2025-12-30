@@ -43,6 +43,7 @@ export default function GamePage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [videoKey, setVideoKey] = useState(0); // For replaying video
   
   // Connection and subscription state
   const [connectionStatus, setConnectionStatus] = useState<'connected' | 'disconnected' | 'reconnecting'>('connected');
@@ -1327,6 +1328,19 @@ export default function GamePage() {
               <p className="text-xs text-gray-500">Score</p>
             </div>
           </div>
+          {/* Exit Game Button */}
+          <div className="mt-3 pt-3 border-t border-gray-200">
+            <button
+              onClick={() => {
+                if (confirm('Are you sure you want to leave the game? You can rejoin later with the same join code.')) {
+                  router.push('/');
+                }
+              }}
+              className="w-full rounded-lg border-2 border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50"
+            >
+              Exit Game
+            </button>
+          </div>
         </div>
 
         {/* Turn Info */}
@@ -1418,17 +1432,27 @@ export default function GamePage() {
                 {/* Check if we have a video ID to embed, or if it's a direct video URL */}
                 {currentShow.youtube_video_id ? (
                   // We have a video ID - embed it
-                  <div className="aspect-video w-full overflow-hidden rounded-lg bg-gray-900">
+                  <div className="aspect-video w-full overflow-hidden rounded-lg bg-gray-900 relative">
                     <iframe
+                      key={videoKey} // Key forces reload when changed
                       width="100%"
                       height="100%"
-                      src={`https://www.youtube.com/embed/${currentShow.youtube_video_id}`}
+                      src={`https://www.youtube.com/embed/${currentShow.youtube_video_id}?autoplay=1`}
                       title={currentShow.show_name}
                       frameBorder="0"
                       allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
                       allowFullScreen
                       className="h-full w-full"
                     />
+                    {/* Replay Button Overlay */}
+                    <button
+                      onClick={() => setVideoKey(prev => prev + 1)}
+                      className="absolute top-2 right-2 rounded-lg bg-black/70 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-black/90 flex items-center gap-1.5"
+                      title="Replay Video"
+                    >
+                      <span>↻</span>
+                      <span>Replay</span>
+                    </button>
                   </div>
                 ) : currentShow.youtube_url.includes('results?search_query=') ? (
                   // Search URL without resolved video ID - show loading/retry
@@ -1452,30 +1476,48 @@ export default function GamePage() {
                   </div>
                 ) : (
                   // Direct video URL - extract video ID and embed
-                  <div className="aspect-video w-full overflow-hidden rounded-lg bg-gray-900">
+                  <div className="aspect-video w-full overflow-hidden rounded-lg bg-gray-900 relative">
                     <iframe
+                      key={videoKey} // Key forces reload when changed
                       width="100%"
                       height="100%"
-                      src={currentShow.youtube_url.replace('watch?v=', 'embed/')}
+                      src={currentShow.youtube_url.replace('watch?v=', 'embed/') + '?autoplay=1'}
                       title={currentShow.show_name}
                       frameBorder="0"
                       allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
                       allowFullScreen
                       className="h-full w-full"
                     />
+                    {/* Replay Button Overlay */}
+                    <button
+                      onClick={() => setVideoKey(prev => prev + 1)}
+                      className="absolute top-2 right-2 rounded-lg bg-black/70 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-black/90 flex items-center gap-1.5"
+                      title="Replay Video"
+                    >
+                      <span>↻</span>
+                      <span>Replay</span>
+                    </button>
                   </div>
                 )}
                 <div className="text-center text-sm text-gray-600">
                   <p className="font-semibold">{currentShow.show_name}</p>
                   <p>{currentShow.network} • {currentShow.artist}</p>
                 </div>
-                <button
-                  onClick={handleDjReady}
-                  disabled={loading}
-                  className="w-full rounded-lg bg-purple-600 px-4 py-3 font-medium text-white transition-colors hover:bg-purple-700 disabled:opacity-50"
-                >
-                  {loading ? 'Loading...' : 'Ready - Start Guessing'}
-                </button>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setVideoKey(prev => prev + 1)}
+                    className="flex-1 rounded-lg border-2 border-gray-300 bg-white px-4 py-3 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50"
+                  >
+                    ↻ Replay Video
+                  </button>
+                  <button
+                    onClick={handleDjReady}
+                    disabled={loading}
+                    className="flex-1 rounded-lg bg-purple-600 px-4 py-3 font-medium text-white transition-colors hover:bg-purple-700 disabled:opacity-50"
+                  >
+                    {loading ? 'Loading...' : 'Ready - Start Guessing'}
+                  </button>
+                </div>
               </div>
             ) : (
               <div className="rounded-lg bg-yellow-50 border border-yellow-200 p-4">
@@ -1629,8 +1671,72 @@ export default function GamePage() {
           </div>
         )}
 
+        {/* DJ Video During Guessing - Show video with replay for DJ */}
+        {isDj && gameState.round_state === 'guessing' && currentShow && (
+          <div className="rounded-2xl bg-white p-4 shadow-lg border-2 border-blue-200">
+            <h2 className="mb-3 text-lg font-semibold text-gray-900">Theme Song (DJ View)</h2>
+            <div className="space-y-3">
+              {currentShow.youtube_video_id ? (
+                <div className="aspect-video w-full overflow-hidden rounded-lg bg-gray-900 relative">
+                  <iframe
+                    key={videoKey}
+                    width="100%"
+                    height="100%"
+                    src={`https://www.youtube.com/embed/${currentShow.youtube_video_id}`}
+                    title={currentShow.show_name}
+                    frameBorder="0"
+                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                    allowFullScreen
+                    className="h-full w-full"
+                  />
+                  <button
+                    onClick={() => setVideoKey(prev => prev + 1)}
+                    className="absolute top-2 right-2 rounded-lg bg-black/70 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-black/90 flex items-center gap-1.5"
+                    title="Replay Video"
+                  >
+                    <span>↻</span>
+                    <span>Replay</span>
+                  </button>
+                </div>
+              ) : currentShow.youtube_url.includes('watch?v=') ? (
+                <div className="aspect-video w-full overflow-hidden rounded-lg bg-gray-900 relative">
+                  <iframe
+                    key={videoKey}
+                    width="100%"
+                    height="100%"
+                    src={currentShow.youtube_url.replace('watch?v=', 'embed/')}
+                    title={currentShow.show_name}
+                    frameBorder="0"
+                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                    allowFullScreen
+                    className="h-full w-full"
+                  />
+                  <button
+                    onClick={() => setVideoKey(prev => prev + 1)}
+                    className="absolute top-2 right-2 rounded-lg bg-black/70 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-black/90 flex items-center gap-1.5"
+                    title="Replay Video"
+                  >
+                    <span>↻</span>
+                    <span>Replay</span>
+                  </button>
+                </div>
+              ) : null}
+              <div className="text-center text-sm text-gray-600">
+                <p className="font-semibold">{currentShow.show_name}</p>
+                <p>{currentShow.network} • {currentShow.artist}</p>
+              </div>
+              <button
+                onClick={() => setVideoKey(prev => prev + 1)}
+                className="w-full rounded-lg border-2 border-gray-300 bg-white px-4 py-3 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50"
+              >
+                ↻ Replay Video
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Waiting for Guess */}
-        {gameState.round_state === 'guessing' && !isGuesser && (
+        {gameState.round_state === 'guessing' && !isGuesser && !isDj && (
           <div className="rounded-2xl bg-white p-4 shadow-lg border-2 border-gray-200">
             <h2 className="mb-3 text-lg font-semibold text-gray-900">Waiting for Guess</h2>
             <p className="text-sm text-gray-600">
