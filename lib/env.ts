@@ -7,10 +7,18 @@ function getEnvVar(name: string, required = true): string {
   const value = process.env[name];
   
   if (required && (!value || value.trim() === '')) {
-    throw new Error(
-      `Missing required environment variable: ${name}\n` +
-      `Please set ${name} in your .env.local file or Vercel environment variables.`
-    );
+    // Provide helpful error message with deployment context
+    const isVercel = process.env.VERCEL === '1';
+    const vercelEnv = process.env.VERCEL_ENV || 'unknown';
+    const errorMessage = isVercel
+      ? `Missing required environment variable: ${name}\n` +
+        `Environment: ${vercelEnv}\n` +
+        `Please verify ${name} is set in Vercel Project Settings → Environment Variables for ${vercelEnv} environment.\n` +
+        `Then redeploy your project.`
+      : `Missing required environment variable: ${name}\n` +
+        `Please set ${name} in your .env.local file or Vercel environment variables.`;
+    
+    throw new Error(errorMessage);
   }
   
   return value || '';
