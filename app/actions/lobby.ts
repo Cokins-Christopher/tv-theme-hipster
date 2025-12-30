@@ -1,3 +1,8 @@
+/**
+ * SERVER ONLY: uses service role
+ * Server actions for lobby management
+ */
+
 'use server';
 
 import { supabaseAdmin } from '@/lib/supabase/server';
@@ -68,8 +73,8 @@ export async function createLobby(hostName: string): Promise<{ joinCode: string;
       lobbyId: lobby.id,
     };
   } catch (error) {
-    console.error('Error creating lobby:', error);
-    return { error: 'An unexpected error occurred' };
+    console.error('[createLobby] Error:', error);
+    return { error: 'Failed to create lobby. Please try again.' };
   }
 }
 
@@ -110,8 +115,8 @@ export async function joinLobby(joinCode: string, playerName: string): Promise<{
       lobbyId: lobby.id,
     };
   } catch (error) {
-    console.error('Error joining lobby:', error);
-    return { error: 'An unexpected error occurred' };
+    console.error('[joinLobby] Error:', error);
+    return { error: 'Failed to join lobby. Please try again.' };
   }
 }
 

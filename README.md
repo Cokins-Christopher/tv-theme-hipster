@@ -220,6 +220,34 @@ The game uses YouTube search URLs that automatically resolve to the first availa
 - **Mobile-First**: Designed for mobile web (PWA-ready)
 - **No External APIs**: All functionality uses Supabase (no paid APIs required)
 
+### Build & Deploy
+
+**Local build:**
+
+```bash
+npm run build    # Build for production
+npm run start    # Start production server
+npm run check    # Type check + lint
+```
+
+**Health check:**
+
+- Local: `http://localhost:3000/api/health`
+- Production: `https://your-domain.vercel.app/api/health`
+
+### Environment Variables
+
+**Server-only (never exposed to client):**
+
+- `SUPABASE_SERVICE_ROLE_KEY` - Used only in server actions/API routes
+
+**Client-safe (exposed via `NEXT_PUBLIC_` prefix):**
+
+- `NEXT_PUBLIC_SUPABASE_URL` - Supabase project URL
+- `NEXT_PUBLIC_SUPABASE_ANON_KEY` - Public anon key (respects RLS)
+
+All env vars are validated at runtime with clear error messages.
+
 ## 🐛 Troubleshooting
 
 **Videos not loading?**

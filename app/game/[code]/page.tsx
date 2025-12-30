@@ -1696,7 +1696,7 @@ export default function GamePage() {
               <p className="text-sm text-gray-600">Artist: {currentShow.artist}</p>
               <p className="text-xl font-bold text-purple-600">Premiered: {currentShow.premiere_year}</p>
             </div>
-            {lobby.status === 'finished' ? (
+            {(lobby.status as string) === 'finished' ? (
               <button
                 onClick={() => router.push(`/lobby/${code}`)}
                 className="mt-4 w-full rounded-lg bg-purple-600 px-4 py-3 font-medium text-white transition-colors hover:bg-purple-700"

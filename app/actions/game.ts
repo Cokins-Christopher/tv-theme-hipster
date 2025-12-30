@@ -1,3 +1,8 @@
+/**
+ * SERVER ONLY: uses service role
+ * Server actions for game logic
+ */
+
 'use server';
 
 import { supabaseAdmin } from '@/lib/supabase/server';
@@ -186,8 +191,8 @@ export async function startGame(lobbyId: string, hostPlayerId: string): Promise<
 
     return { success: true };
   } catch (error) {
-    console.error('Error starting game:', error);
-    return { error: 'An unexpected error occurred' };
+    console.error('[startGame] Error:', error);
+    return { error: 'Failed to start game. Please try again.' };
   }
 }
 
@@ -365,8 +370,8 @@ export async function submitAttempt(
       return { success: true, isCorrect: false };
     }
   } catch (error) {
-    console.error('Error submitting attempt:', error);
-    return { error: 'An unexpected error occurred' };
+    console.error('[submitAttempt] Error:', error);
+    return { error: 'Failed to submit guess. Please try again.' };
   }
 }
 
@@ -480,8 +485,8 @@ export async function advanceRound(lobbyId: string, hostPlayerId: string): Promi
 
     return { success: true };
   } catch (error) {
-    console.error('Error advancing round:', error);
-    return { error: 'An unexpected error occurred' };
+    console.error('[advanceRound] Error:', error);
+    return { error: 'Failed to advance round. Please try again.' };
   }
 }
 
@@ -530,8 +535,8 @@ export async function markDjReady(lobbyId: string, playerId: string): Promise<{ 
 
     return { success: true };
   } catch (error) {
-    console.error('Error marking DJ ready:', error);
-    return { error: 'An unexpected error occurred' };
+    console.error('[markDjReady] Error:', error);
+    return { error: 'Failed to mark DJ ready. Please try again.' };
   }
 }
 

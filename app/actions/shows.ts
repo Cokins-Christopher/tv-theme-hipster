@@ -1,3 +1,8 @@
+/**
+ * SERVER ONLY: uses service role
+ * Server actions for show/video management
+ */
+
 'use server';
 
 import { supabaseAdmin } from '@/lib/supabase/server';
